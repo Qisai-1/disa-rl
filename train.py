@@ -439,8 +439,8 @@ ENV_REGISTRY = {
     "walker2d-medium-replay-v2":    (17, 6, "./data/walker2d-medium-replay-v2.npz"),
     "walker2d-expert-v2":           (17, 6, "./data/walker2d-expert-v2.npz"),
     # Ant
-    "ant-medium-v2":                (27, 8, "./data/ant-medium-v2.npz"),
-    "ant-medium-replay-v2":         (27, 8, "./data/ant-medium-replay-v2.npz"),
+    "ant-medium-v2":                (111, 8, "./data/ant-medium-v2.npz"),
+    "ant-medium-replay-v2":         (111, 8, "./data/ant-medium-replay-v2.npz"),
 }
 
 

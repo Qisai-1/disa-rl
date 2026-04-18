@@ -55,7 +55,7 @@ ENV_DIMS = {
     "halfcheetah": (17, 6),
     "hopper":      (11, 3),
     "walker2d":    (17, 6),
-    "ant":         (27, 8),
+    "ant":         (111, 8),
 }
 
 
