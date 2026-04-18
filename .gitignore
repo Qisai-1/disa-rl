@@ -1,7 +1,14 @@
-# Data and checkpoints (too large for git)
+# Data (large binary files)
 data/
+
+# Trained model checkpoints
 checkpoints/
+
+# WandB logs
 wandb/
+
+# Results (generated files)
+results/
 
 # Python
 __pycache__/
@@ -9,9 +16,24 @@ __pycache__/
 *.pyo
 *.egg-info/
 .eggs/
+*.so
 
-# Jupyter
-.ipynb_checkpoints/
+# Environment
+.env
+*.env
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+tea_debug.log
+
+# Temporary
+*.tmp
+*.bak
