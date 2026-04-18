@@ -1,0 +1,14 @@
+torch>=2.1.0
+numpy>=1.24.0
+einops>=0.7.0
+wandb>=0.16.0
+tqdm>=4.65.0
+
+# D4RL dataset loading (choose one):
+# Option A — full d4rl (requires MuJoCo licence):
+#   pip install d4rl
+# Option B — lightweight loader (no MuJoCo needed, downloads only the .npz):
+#   pip install minari
+
+# Optional but recommended:
+# torch-nightly for Flash Attention 2 on older GPUs

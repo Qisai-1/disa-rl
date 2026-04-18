@@ -1,0 +1,17 @@
+# Data and checkpoints (too large for git)
+data/
+checkpoints/
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
