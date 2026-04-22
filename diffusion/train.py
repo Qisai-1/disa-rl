@@ -14,17 +14,13 @@ Two training modes
 """
 
 from __future__ import annotations
-import sys, os as _os
-_d = _os.path.dirname(_os.path.abspath(__file__))
-if _d not in sys.path: sys.path.insert(0, _d)
-if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import os
 import copy
 import numpy as np
 import torch
 import wandb
 from torch.utils.data import DataLoader, ConcatDataset
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import autocast
 from tqdm import tqdm
 from typing import Optional
 
@@ -103,9 +99,16 @@ def save_checkpoint(
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = TrajectoryDiT(**ckpt["model_config"]).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Strip _orig_mod. prefix added by torch.compile
+    model_sd = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in model_sd):
+        model_sd = {k.replace("_orig_mod.", ""): v for k, v in model_sd.items()}
+    model.load_state_dict(model_sd)
     ema   = EMA(model)
-    ema.load_state_dict(ckpt["ema_state_dict"])
+    ema_sd = ckpt["ema_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in ema_sd):
+        ema_sd = {k.replace("_orig_mod.", ""): v for k, v in ema_sd.items()}
+    ema.load_state_dict(ema_sd)
     normalizer = DataNormalizer.from_dict(ckpt["normalizer"])
     return model, ema, normalizer, ckpt
 
@@ -204,7 +207,6 @@ def train_offline(
     model = TrajectoryDiT(
         obs_dim           = cfg.model.obs_dim,
         action_dim        = cfg.model.action_dim,
-        reward_dim        = cfg.model.reward_dim,
         trajectory_length = cfg.model.trajectory_length,
         hidden_size       = cfg.model.hidden_size,
         depth             = cfg.model.depth,
@@ -232,7 +234,6 @@ def train_offline(
         betas        = (0.9, 0.999),
     )
     scheduler = cosine_with_warmup(optimizer, cfg.training.warmup_steps, cfg.training.num_steps)
-    scaler    = GradScaler()
 
     start_step = 0
     if resume_from:
@@ -273,13 +274,18 @@ def train_offline(
         cond = batch["condition"].to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=True):
-            loss, metrics = cfm.loss(x1, cond)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        # Pure float32 — autocast disabled for stability with torch.compile
+        loss, metrics = cfm.loss(x1, cond)
+
+        # Early NaN detection — stop immediately if loss diverges
+        if not torch.isfinite(loss):
+            print(f"\n[step {step}] NaN/Inf loss detected! loss={loss.item()}")
+            print("Stopping training — check data and learning rate.")
+            break
+
+        loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         scheduler.step()
         ema.update(model)
 
@@ -374,7 +380,6 @@ def finetune_online(
                            shuffle=True, num_workers=2, pin_memory=True, drop_last=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scaler    = GradScaler()
 
     model.train()
     for step in tqdm(range(n_steps), desc="Online fine-tune"):
@@ -474,6 +479,10 @@ if __name__ == "__main__":
         help="Path to checkpoint to resume from.",
     )
     parser.add_argument(
+        "--lr", type=float, default=None,
+        help="Override learning rate (useful when resuming diverged training).",
+    )
+    parser.add_argument(
         "--wandb_entity", type=str, default="",
         help="WandB username/team.",
     )
@@ -501,13 +510,12 @@ if __name__ == "__main__":
         loss = LossConfig(
             lambda_obs      = 1.0,
             lambda_action   = 1.0,
-            lambda_reward   = 0.5,
             lambda_temporal = 0.1,
             lambda_ewc      = 500.0,
         ),
         training = TrainingConfig(
             batch_size   = args.batch_size,
-            lr           = 1e-4,
+            lr           = args.lr if args.lr is not None else 1e-4,
             weight_decay = 1e-4,
             num_steps    = args.num_steps,
             grad_clip    = 1.0,
@@ -539,7 +547,7 @@ if __name__ == "__main__":
     print(f"  Environment : {args.env}")
     print(f"  obs_dim     : {obs_dim}   action_dim: {action_dim}")
     print(f"  batch_size  : {args.batch_size}")
-    print(f"  output_dir  : ./checkpoints/{args.env}/")
+    print(f"  output_dir  : ./checkpoints/{args.env}/diffusion/")
     print(f"  WandB run   : {cfg.exp_name}")
     print(f"{'='*55}\n")
 

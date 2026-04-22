@@ -1,3 +1,7 @@
+import sys, os as _os
+_d = _os.path.dirname(_os.path.abspath(__file__))
+if _d not in sys.path: sys.path.insert(0, _d)
+sys.path.insert(0, _os.path.join(_d, "diffusion"))
 """
 Pre-generate synthetic trajectories from a trained diffusion model
 and save them to disk as a .npz file.
@@ -24,7 +28,7 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from generate import TrajectoryGenerator, GenerationConfig
+from diffusion.generate import TrajectoryGenerator, GenerationConfig
 from reward_computer import RewardComputer
 
 ENV_REGISTRY = {

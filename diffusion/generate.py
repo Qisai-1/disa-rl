@@ -13,10 +13,6 @@ Usage in the online fine-tuning loop:
 """
 
 from __future__ import annotations
-import sys, os as _os
-_d = _os.path.dirname(_os.path.abspath(__file__))
-if _d not in sys.path: sys.path.insert(0, _d)
-if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import numpy as np
 import torch
 from torch.cuda.amp import GradScaler
@@ -26,6 +22,7 @@ from typing import Dict, List, Optional
 from model import TrajectoryDiT
 from flow_matching import ConditionalFlowMatching
 from data import DataNormalizer
+from reward_computer import RewardComputer
 from config import LossConfig
 
 
@@ -77,8 +74,13 @@ class TrajectoryGenerator:
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
         model = TrajectoryDiT(**ckpt["model_config"]).to(device)
-        # Use EMA weights for generation (smoother, better quality)
-        model.load_state_dict(ckpt["ema_state_dict"])
+
+        # Strip _orig_mod. prefix added by torch.compile when saving EMA weights
+        ema_sd = ckpt["ema_state_dict"]
+        if any(k.startswith("_orig_mod.") for k in ema_sd):
+            ema_sd = {k.replace("_orig_mod.", ""): v for k, v in ema_sd.items()}
+
+        model.load_state_dict(ema_sd)
         model.eval()
 
         normalizer = DataNormalizer.from_dict(ckpt["normalizer"])
@@ -167,12 +169,28 @@ class TrajectoryGenerator:
             cfg_scale  = gen_cfg.cfg_scale,
         ).cpu().numpy()   # (B, T, D)
 
-        # Denormalise
+        # Clip extreme values in normalised space before denormalising
+        # (prevents NaN/inf from propagating through denormalisation)
+        trajs_norm = np.clip(trajs_norm, -10.0, 10.0)
+
+        # Replace any remaining NaN/inf with 0 in normalised space
+        trajs_norm = np.nan_to_num(trajs_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Denormalise — trajs_norm is (B, T, obs+action), no reward
         trajs_raw = self.normalizer.denormalize_batch(trajs_norm, obs_dim, action_dim)
 
         obs     = trajs_raw[:, :, :obs_dim]
         actions = trajs_raw[:, :, obs_dim:obs_dim + action_dim]
-        rewards = trajs_raw[:, :, -1]
+        # Compute rewards analytically — not from diffusion output
+        if not hasattr(self, '_reward_computer'):
+            self._reward_computer = RewardComputer.make(
+                next((k for k in ["halfcheetah","hopper","walker2d","ant"]
+                      if k in str(self.normalizer.__class__)), "halfcheetah")
+            )
+        B, T, _ = obs.shape
+        rewards = self._reward_computer.compute(
+            obs.reshape(B*T, obs_dim), actions.reshape(B*T, action_dim)
+        ).reshape(B, T)
 
         if gen_cfg.clip_actions:
             actions = np.clip(actions, -1.0, 1.0)

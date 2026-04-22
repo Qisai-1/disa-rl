@@ -91,17 +91,17 @@ class DataNormalizer:
     # ------------------------------------------------------------------
 
     def normalize_batch(self, trajs: np.ndarray, obs_dim: int, action_dim: int) -> np.ndarray:
+        """Normalise (obs, action) trajectories — no reward dimension."""
         out = trajs.copy().astype(np.float32)
         out[..., :obs_dim]                     = self.obs.normalize(trajs[..., :obs_dim])
         out[..., obs_dim:obs_dim + action_dim] = self.action.normalize(trajs[..., obs_dim:obs_dim + action_dim])
-        out[..., -1:]                          = self.reward.normalize(trajs[..., -1:])
         return out
 
     def denormalize_batch(self, trajs: np.ndarray, obs_dim: int, action_dim: int) -> np.ndarray:
+        """Denormalise (obs, action) trajectories — no reward dimension."""
         out = trajs.copy().astype(np.float32)
         out[..., :obs_dim]                     = self.obs.denormalize(trajs[..., :obs_dim])
         out[..., obs_dim:obs_dim + action_dim] = self.action.denormalize(trajs[..., obs_dim:obs_dim + action_dim])
-        out[..., -1:]                          = self.reward.denormalize(trajs[..., -1:])
         return out
 
     def normalize_return(self, r: float) -> float:
@@ -273,7 +273,7 @@ class TrajectoryDataset(Dataset):
 
     def __init__(
         self,
-        trajs:           np.ndarray,    # (N, T, D) raw unnormalised
+        trajs:           np.ndarray,    # (N, T, D_full) raw unnormalised, D_full includes reward
         returns:         np.ndarray,    # (N,)
         normalizer:      DataNormalizer,
         obs_dim:         int  = 17,
@@ -285,8 +285,11 @@ class TrajectoryDataset(Dataset):
         self.normalizer      = normalizer
         self.use_return_cond = use_return_cond
 
+        # Keep only (obs, action) — drop reward column before normalising
+        trajs_oa = trajs[..., :obs_dim + action_dim]
+
         # Normalise all trajectories up front (keeps __getitem__ cheap)
-        self.trajs = normalizer.normalize_batch(trajs, obs_dim, action_dim)
+        self.trajs = normalizer.normalize_batch(trajs_oa, obs_dim, action_dim)
 
         # Normalised returns for conditioning
         self.norm_returns = (
