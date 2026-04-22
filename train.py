@@ -531,14 +531,14 @@ if __name__ == "__main__":
         # Each env gets a unique run name on WandB
         exp_name      = f"{env_tag}_bs{args.batch_size}",
         # Each env gets its own checkpoint folder
-        output_dir    = f"./checkpoints/{args.env}",
+        output_dir    = f"./checkpoints/{args.env}/diffusion",
     )
 
     print(f"\n{'='*55}")
     print(f"  Environment : {args.env}")
     print(f"  obs_dim     : {obs_dim}   action_dim: {action_dim}")
     print(f"  batch_size  : {args.batch_size}")
-    print(f"  output_dir  : ./checkpoints/{args.env}/")
+    print(f"  output_dir  : ./checkpoints/{args.env}/diffusion/")
     print(f"  WandB run   : {cfg.exp_name}")
     print(f"{'='*55}\n")
 
