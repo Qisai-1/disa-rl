@@ -73,8 +73,13 @@ class TrajectoryGenerator:
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
         model = TrajectoryDiT(**ckpt["model_config"]).to(device)
-        # Use EMA weights for generation (smoother, better quality)
-        model.load_state_dict(ckpt["ema_state_dict"])
+
+        # Strip _orig_mod. prefix added by torch.compile when saving EMA weights
+        ema_sd = ckpt["ema_state_dict"]
+        if any(k.startswith("_orig_mod.") for k in ema_sd):
+            ema_sd = {k.replace("_orig_mod.", ""): v for k, v in ema_sd.items()}
+
+        model.load_state_dict(ema_sd)
         model.eval()
 
         normalizer = DataNormalizer.from_dict(ckpt["normalizer"])
@@ -162,6 +167,13 @@ class TrajectoryGenerator:
             nfe        = gen_cfg.nfe,
             cfg_scale  = gen_cfg.cfg_scale,
         ).cpu().numpy()   # (B, T, D)
+
+        # Clip extreme values in normalised space before denormalising
+        # (prevents NaN/inf from propagating through denormalisation)
+        trajs_norm = np.clip(trajs_norm, -10.0, 10.0)
+
+        # Replace any remaining NaN/inf with 0 in normalised space
+        trajs_norm = np.nan_to_num(trajs_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Denormalise
         trajs_raw = self.normalizer.denormalize_batch(trajs_norm, obs_dim, action_dim)

@@ -101,7 +101,10 @@ def load_checkpoint(path: str, device: torch.device):
     model = TrajectoryDiT(**ckpt["model_config"]).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     ema   = EMA(model)
-    ema.load_state_dict(ckpt["ema_state_dict"])
+    ema_sd = ckpt["ema_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in ema_sd):
+        ema_sd = {k.replace("_orig_mod.", ""): v for k, v in ema_sd.items()}
+    ema.load_state_dict(ema_sd)
     normalizer = DataNormalizer.from_dict(ckpt["normalizer"])
     return model, ema, normalizer, ckpt
 
