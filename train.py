@@ -99,7 +99,11 @@ def save_checkpoint(
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = TrajectoryDiT(**ckpt["model_config"]).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Strip _orig_mod. prefix added by torch.compile
+    model_sd = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in model_sd):
+        model_sd = {k.replace("_orig_mod.", ""): v for k, v in model_sd.items()}
+    model.load_state_dict(model_sd)
     ema   = EMA(model)
     ema_sd = ckpt["ema_state_dict"]
     if any(k.startswith("_orig_mod.") for k in ema_sd):
