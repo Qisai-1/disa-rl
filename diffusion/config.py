@@ -29,6 +29,7 @@ class ModelConfig:
     # Conditioning
     use_return_cond:  bool  = True
     cfg_dropout_prob: float = 0.10
+    mlp_dropout:      float = 0.1    # MLP dropout — regularises 39M param model on small dataset
 
     @property
     def feature_dim(self) -> int:
@@ -67,6 +68,8 @@ class TrainingConfig:
     log_every:    int   = 100
     val_every:    int   = 2_000
     num_workers:  int   = 4
+    patience:     int   = 10       # early stop after N val checks without improvement
+    min_delta:    float = 1e-4     # min improvement to reset patience
 
 
 @dataclass

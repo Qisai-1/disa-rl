@@ -141,7 +141,7 @@ class MultiModalEmbedding(nn.Module):
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0,
-                 max_seq_len=1024, rope_theta=10_000.0):
+                 max_seq_len=1024, rope_theta=10_000.0, mlp_dropout=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn  = RoPEAttention(hidden_size, num_heads, max_seq_len, rope_theta)
@@ -150,7 +150,9 @@ class DiTBlock(nn.Module):
         self.mlp   = nn.Sequential(
             nn.Linear(hidden_size, mlp_dim),
             nn.GELU(approximate="tanh"),
+            nn.Dropout(mlp_dropout),
             nn.Linear(mlp_dim, hidden_size),
+            nn.Dropout(mlp_dropout),
         )
         self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6*hidden_size))
         nn.init.zeros_(self.adaLN[-1].weight)
@@ -204,6 +206,7 @@ class TrajectoryDiT(nn.Module):
         max_seq_len:       int   = 1_024,
         use_return_cond:   bool  = True,
         cfg_dropout_prob:  float = 0.10,
+        mlp_dropout:       float = 0.0,
     ):
         super().__init__()
         self.obs_dim           = obs_dim
@@ -218,6 +221,7 @@ class TrajectoryDiT(nn.Module):
         self.max_seq_len       = max_seq_len
         self.use_return_cond   = use_return_cond
         self.cfg_dropout_prob  = cfg_dropout_prob
+        self.mlp_dropout       = mlp_dropout
 
         cond_dim = obs_dim + (1 if use_return_cond else 0)
 
@@ -225,7 +229,7 @@ class TrajectoryDiT(nn.Module):
         self.tau_emb  = TimestepEmbedder(hidden_size)
         self.cond_emb = ConditionEmbedder(cond_dim, hidden_size)
         self.blocks   = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio, max_seq_len, rope_theta)
+            DiTBlock(hidden_size, num_heads, mlp_ratio, max_seq_len, rope_theta, mlp_dropout)
             for _ in range(depth)
         ])
         self.head = FinalLayer(hidden_size, self.D)
@@ -261,6 +265,7 @@ class TrajectoryDiT(nn.Module):
             max_seq_len       = self.max_seq_len,
             use_return_cond   = self.use_return_cond,
             cfg_dropout_prob  = self.cfg_dropout_prob,
+            mlp_dropout       = self.mlp_dropout,
         )
 
 

@@ -216,6 +216,7 @@ def train_offline(
         max_seq_len       = cfg.model.max_seq_len,
         use_return_cond   = cfg.model.use_return_cond,
         cfg_dropout_prob  = cfg.model.cfg_dropout_prob,
+        mlp_dropout       = cfg.model.mlp_dropout,
     ).to(device)
 
     try:
@@ -256,8 +257,13 @@ def train_offline(
         },
     )
 
+    # ── Early stopping state ──────────────────────────────────────────────
+    best_val_loss    = float("inf")
+    patience_counter = 0
+
     # ── Training loop ──────────────────────────────────────────────────────
     print(f"\n─── Offline training: {cfg.training.num_steps:,} steps ───")
+    print(f"    Early stopping: patience={cfg.training.patience} val checks")
     train_iter = iter(train_loader)
     pbar = tqdm(total=cfg.training.num_steps, initial=start_step, desc="Offline train")
 
@@ -298,8 +304,24 @@ def train_offline(
         if step % cfg.training.val_every == 0 and step > 0:
             val_metrics = validate(cfm, val_loader, device)
             wandb.log(val_metrics, step=step)
-            print(f"\n[{step:>7d}]  val_loss={val_metrics['val/loss/total']:.4f}  "
+            val_loss = val_metrics["val/loss/total"]
+            print(f"\n[{step:>7d}]  val_loss={val_loss:.4f}  "
                   f"obs_std={val_metrics['val/gen_obs_std']:.3f}")
+
+            # Early stopping
+            if val_loss < best_val_loss - cfg.training.min_delta:
+                best_val_loss    = val_loss
+                patience_counter = 0
+                # Save best model
+                save_checkpoint(model, ema, optimizer, scheduler, normalizer,
+                               step, os.path.join(cfg.output_dir, "best.pt"))
+            else:
+                patience_counter += 1
+                print(f"    No improvement ({patience_counter}/{cfg.training.patience})")
+                if patience_counter >= cfg.training.patience:
+                    print(f"\nEarly stopping at step {step} "
+                          f"(best val_loss={best_val_loss:.4f})")
+                    break
 
         if step % cfg.training.save_every == 0 and step > 0:
             save_checkpoint(model, ema, optimizer, scheduler, normalizer, step,
@@ -506,6 +528,7 @@ if __name__ == "__main__":
             num_heads         = 8,
             cfg_dropout_prob  = 0.10,
             use_return_cond   = True,
+            mlp_dropout       = 0.1,
         ),
         loss = LossConfig(
             lambda_obs      = 1.0,
