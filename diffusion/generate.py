@@ -13,10 +13,6 @@ Usage in the online fine-tuning loop:
 """
 
 from __future__ import annotations
-import sys, os as _os
-_d = _os.path.dirname(_os.path.abspath(__file__))
-if _d not in sys.path: sys.path.insert(0, _d)
-if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import numpy as np
 import torch
 from torch.cuda.amp import GradScaler
@@ -77,7 +73,11 @@ class TrajectoryGenerator:
         """Load generator from a training checkpoint.  Uses EMA weights."""
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
-        model = TrajectoryDiT(**ckpt["model_config"]).to(device)
+        # Build model from checkpoint config
+        # Handle older checkpoints that don't have mlp_dropout key
+        model_cfg = dict(ckpt["model_config"])
+        model_cfg.setdefault("mlp_dropout", 0.0)  # old checkpoints have no dropout
+        model = TrajectoryDiT(**model_cfg).to(device)
 
         # Strip _orig_mod. prefix added by torch.compile when saving EMA weights
         ema_sd = ckpt["ema_state_dict"]
@@ -89,9 +89,15 @@ class TrajectoryGenerator:
 
         normalizer = DataNormalizer.from_dict(ckpt["normalizer"])
         cfm        = ConditionalFlowMatching(model, device)
+        env_name   = ckpt.get("env_name", "")
 
+        gen = cls(model, cfm, normalizer, device)
+        # Build reward computer now so env is known
+        if env_name:
+            gen._reward_computer = RewardComputer.make(env_name)
+            gen._env_name = env_name
         print(f"Generator loaded  |  step={ckpt['step']:,}  |  {path}")
-        return cls(model, cfm, normalizer, device)
+        return gen
 
     def attach_ewc(self, ewc) -> None:
         """Attach an EWC instance for use during online fine-tuning."""
@@ -185,12 +191,15 @@ class TrajectoryGenerator:
 
         obs     = trajs_raw[:, :, :obs_dim]
         actions = trajs_raw[:, :, obs_dim:obs_dim + action_dim]
-        # Compute rewards analytically — not from diffusion output
+        # Compute rewards analytically — env detected from checkpoint or obs_dim
         if not hasattr(self, '_reward_computer'):
-            self._reward_computer = RewardComputer.make(
-                next((k for k in ["halfcheetah","hopper","walker2d","ant"]
-                      if k in str(self.normalizer.__class__)), "halfcheetah")
-            )
+            env_name = getattr(self, '_env_name', '')
+            if not env_name:
+                # Fallback: guess from obs_dim (ant=111 is unambiguous)
+                if obs_dim == 111:   env_name = "ant-medium-v2"
+                elif obs_dim == 11:  env_name = "hopper-medium-v2"
+                else:                env_name = "halfcheetah-medium-v2"
+            self._reward_computer = RewardComputer.make(env_name)
         B, T, _ = obs.shape
         rewards = self._reward_computer.compute(
             obs.reshape(B*T, obs_dim), actions.reshape(B*T, action_dim)

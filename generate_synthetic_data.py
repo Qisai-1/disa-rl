@@ -1,7 +1,3 @@
-import sys, os as _os
-_d = _os.path.dirname(_os.path.abspath(__file__))
-if _d not in sys.path: sys.path.insert(0, _d)
-sys.path.insert(0, _os.path.join(_d, "diffusion"))
 """
 Pre-generate synthetic trajectories from a trained diffusion model
 and save them to disk as a .npz file.
@@ -28,7 +24,7 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from diffusion.generate import TrajectoryGenerator, GenerationConfig
+from generate import TrajectoryGenerator, GenerationConfig
 from reward_computer import RewardComputer
 
 ENV_REGISTRY = {
@@ -80,11 +76,27 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
     # Reward computer — analytic for D4RL locomotion, no diffusion needed
     reward_computer = RewardComputer.make(env, device=device)
 
+    # Load real initial states for conditioning diversity
+    real_data_path = f"./data/{env}.npz"
+    real_obs_for_init = None
+    if os.path.exists(real_data_path):
+        _real = np.load(real_data_path, allow_pickle=True)
+        real_obs_for_init = _real["observations"].astype(np.float32)
+        print(f"Sampling initial states from real data ({len(real_obs_for_init):,} states)")
+
     all_obs, all_actions, all_next_obs, all_dones = [], [], [], []
 
     for i in tqdm(range(n_batches), desc=f"Generating {env}"):
+        # Sample real initial states for CFG conditioning
+        if real_obs_for_init is not None:
+            idx = np.random.choice(len(real_obs_for_init), size=batch_size, replace=True)
+            init_states = real_obs_for_init[idx]
+        else:
+            init_states = None
+
         result = generator.generate(
             n_trajectories=batch_size,
+            initial_states=init_states,
             target_return=target_return,
             gen_cfg=gen_cfg,
         )
@@ -111,14 +123,41 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
     print("Computing rewards analytically...")
     rewards  = reward_computer.compute(obs, actions)
 
-    # Clean any NaN/inf in obs (from diffusion) — rewards are analytic so clean
+    # Clean NaN/inf
     obs      = np.nan_to_num(obs,      nan=0.0, posinf=0.0, neginf=0.0)
     next_obs = np.nan_to_num(next_obs, nan=0.0, posinf=0.0, neginf=0.0)
     actions  = np.clip(actions, -1.0, 1.0)
 
+    # OOD filter: remove transitions outside real data distribution
+    real_data_path = f"./data/{env}.npz"
+    if os.path.exists(real_data_path):
+        real     = np.load(real_data_path, allow_pickle=True)
+        real_obs = real["observations"].astype(np.float32)
+        real_r   = real["rewards"].astype(np.float32)
+        obs_mean = real_obs.mean(axis=0)
+        obs_std  = real_obs.std(axis=0) + 1e-8
+        in_bounds = np.all((obs >= obs_mean - 5*obs_std) & (obs <= obs_mean + 5*obs_std), axis=1)
+        n_before  = len(obs)
+        n_kept    = int(in_bounds.sum())
+        print(f"\nOOD filter: kept {n_kept:,}/{n_before:,} ({100*n_kept/n_before:.1f}%)")
+        if n_kept > 0:
+            obs=obs[in_bounds]; actions=actions[in_bounds]
+            rewards=rewards[in_bounds]; next_obs=next_obs[in_bounds]; dones=dones[in_bounds]
+            rewards = np.clip(rewards, real_r.min()-real_r.std(), real_r.max()+real_r.std())
+            if len(obs) < n_transitions:
+                idx = np.random.choice(len(obs), size=n_transitions-len(obs), replace=True)
+                obs=np.concatenate([obs,obs[idx]]); actions=np.concatenate([actions,actions[idx]])
+                rewards=np.concatenate([rewards,rewards[idx]]); next_obs=np.concatenate([next_obs,next_obs[idx]])
+                dones=np.concatenate([dones,dones[idx]])
+                print(f"  Padded to {len(obs):,} by resampling.")
+        else:
+            print("  WARNING: all transitions OOD — check diffusion model")
+    else:
+        rewards = np.clip(rewards, -10.0, 15.0)
+
     print(f"\nGeneration complete.")
     print(f"  obs shape    : {obs.shape}")
-    print(f"  reward range : [{rewards.min():.3f}, {rewards.max():.3f}]  mean={rewards.mean():.3f}")
+    print(f"  reward range : [{rewards.min():.3f}, {rewards.max():.3f}]  mean={rewards.mean():.3f}  std={rewards.std():.3f}")
     print(f"  action range : [{actions.min():.3f}, {actions.max():.3f}]")
     print(f"  nan count    : obs={np.isnan(obs).sum()}  rew={np.isnan(rewards).sum()}  act={np.isnan(actions).sum()}")
 

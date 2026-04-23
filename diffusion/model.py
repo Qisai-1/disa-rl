@@ -146,14 +146,24 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn  = RoPEAttention(hidden_size, num_heads, max_seq_len, rope_theta)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_dim    = int(hidden_size * mlp_ratio)
-        self.mlp   = nn.Sequential(
-            nn.Linear(hidden_size, mlp_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Dropout(mlp_dropout),
-            nn.Linear(mlp_dim, hidden_size),
-            nn.Dropout(mlp_dropout),
-        )
+        mlp_dim = int(hidden_size * mlp_ratio)
+        # Only add Dropout layers when mlp_dropout > 0
+        # Without this, Dropout(0.0) still changes Sequential indices
+        # and breaks loading of checkpoints trained without dropout
+        if mlp_dropout > 0.0:
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_dim),
+                nn.GELU(approximate="tanh"),
+                nn.Dropout(mlp_dropout),
+                nn.Linear(mlp_dim, hidden_size),
+                nn.Dropout(mlp_dropout),
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_dim),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(mlp_dim, hidden_size),
+            )
         self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6*hidden_size))
         nn.init.zeros_(self.adaLN[-1].weight)
         nn.init.zeros_(self.adaLN[-1].bias)
@@ -206,7 +216,7 @@ class TrajectoryDiT(nn.Module):
         max_seq_len:       int   = 1_024,
         use_return_cond:   bool  = True,
         cfg_dropout_prob:  float = 0.10,
-        mlp_dropout:       float = 0.0,
+        mlp_dropout:       float = 0.0,   # 0.0 = no dropout (backward compat); set 0.1 via Config
     ):
         super().__init__()
         self.obs_dim           = obs_dim

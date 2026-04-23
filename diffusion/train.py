@@ -14,10 +14,6 @@ Two training modes
 """
 
 from __future__ import annotations
-import sys, os as _os
-_d = _os.path.dirname(_os.path.abspath(__file__))
-if _d not in sys.path: sys.path.insert(0, _d)
-if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import os
 import copy
 import numpy as np
@@ -87,6 +83,7 @@ def save_checkpoint(
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload = {
         "step":               step,
+        "env_name":           extra.get("env_name", "") if extra else "",
         "model_config":       model.config_dict(),
         "model_state_dict":   model.state_dict(),
         "ema_state_dict":     ema.state_dict(),
@@ -102,7 +99,10 @@ def save_checkpoint(
 
 def load_checkpoint(path: str, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = TrajectoryDiT(**ckpt["model_config"]).to(device)
+    # Handle older checkpoints that don't have mlp_dropout key
+    model_cfg = dict(ckpt["model_config"])
+    model_cfg.setdefault("mlp_dropout", 0.0)
+    model = TrajectoryDiT(**model_cfg).to(device)
     # Strip _orig_mod. prefix added by torch.compile
     model_sd = ckpt["model_state_dict"]
     if any(k.startswith("_orig_mod.") for k in model_sd):
@@ -145,22 +145,24 @@ def validate(
 
     val_metrics = {f"val/{k}": v / n for k, v in total_metrics.items()}
 
-    # Generation quality check (fast Euler)
+    # Generation quality check — use Heun to match inference quality
     sample_batch = next(iter(val_loader))
     cond_sample  = sample_batch["condition"][:16].to(device)
-    gen = cfm.euler_sample(16, cond_sample, nfe=10)   # (16, T, D)
+    gen = cfm.heun_sample(16, cond_sample, nfe=20)   # (16, T, D)
 
     obs_dim    = cfm.model.obs_dim
     action_dim = cfm.model.action_dim
 
-    # These should all be ~1.0 if normalisation is correct and generation is working
+    # Gen obs std should be ~1.0 in normalised space (data is z-scored)
     val_metrics["val/gen_obs_std"]      = gen[:, :, :obs_dim].std().item()
+    # Gen action range should be within [-3, 3] in normalised space
     val_metrics["val/gen_action_range"] = gen[:, :, obs_dim:obs_dim+action_dim].abs().max().item()
-    val_metrics["val/gen_reward_mean"]  = gen[:, :, -1].mean().item()
-
-    # Temporal smoothness of generated observations (lower = smoother)
+    # No reward dim — check obs temporal smoothness instead
+    # Temporal smoothness of generated observations (lower = smoother trajectories)
     delta_gen = (gen[:, 1:, :obs_dim] - gen[:, :-1, :obs_dim]).norm(dim=-1)
     val_metrics["val/gen_obs_delta_mean"] = delta_gen.mean().item()
+    # NaN check in generated samples
+    val_metrics["val/gen_nan_count"] = float(torch.isnan(gen).sum().item())
 
     cfm.model.train()
     return val_metrics
@@ -329,7 +331,8 @@ def train_offline(
 
         if step % cfg.training.save_every == 0 and step > 0:
             save_checkpoint(model, ema, optimizer, scheduler, normalizer, step,
-                           os.path.join(cfg.output_dir, f"offline_step{step:07d}.pt"))
+                           os.path.join(cfg.output_dir, f"offline_step{step:07d}.pt"),
+                           extra={"env_name": cfg.data.dataset_name})
         pbar.update(1)
 
     pbar.close()
@@ -347,9 +350,19 @@ def train_offline(
 
     final_path = os.path.join(cfg.output_dir, "offline_final.pt")
     ewc_path   = os.path.join(cfg.output_dir, "ewc_state.pt")
+    best_path  = os.path.join(cfg.output_dir, "best.pt")
 
-    save_checkpoint(model, ema, optimizer, scheduler, normalizer,
-                   cfg.training.num_steps, final_path)
+    # Use best checkpoint weights if early stopping saved one
+    # EMA weights from the best validation step are higher quality
+    if os.path.exists(best_path):
+        import shutil
+        shutil.copy2(best_path, final_path)
+        print(f"offline_final.pt ← best.pt  (val_loss={best_val_loss:.4f})")
+    else:
+        save_checkpoint(model, ema, optimizer, scheduler, normalizer,
+                       cfg.training.num_steps, final_path,
+                       extra={"env_name": cfg.data.dataset_name})
+        print(f"offline_final.pt ← last step weights")
     ewc.save(ewc_path)
     wandb.finish()
 
