@@ -13,6 +13,10 @@ Usage in the online fine-tuning loop:
 """
 
 from __future__ import annotations
+import sys, os as _os
+_d = _os.path.dirname(_os.path.abspath(__file__))
+if _d not in sys.path: sys.path.insert(0, _d)
+if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import numpy as np
 import torch
 from torch.cuda.amp import GradScaler

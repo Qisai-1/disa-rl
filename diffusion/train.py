@@ -14,6 +14,10 @@ Two training modes
 """
 
 from __future__ import annotations
+import sys, os as _os
+_d = _os.path.dirname(_os.path.abspath(__file__))
+if _d not in sys.path: sys.path.insert(0, _d)
+if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import os
 import copy
 import numpy as np

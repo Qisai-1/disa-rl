@@ -13,6 +13,10 @@ Pure float32 — no autocast. Avoids NaN with torch.compile on PyTorch 2.2.
 """
 
 from __future__ import annotations
+import sys, os as _os
+_d = _os.path.dirname(_os.path.abspath(__file__))
+if _d not in sys.path: sys.path.insert(0, _d)
+if _os.path.dirname(_d) not in sys.path: sys.path.insert(0, _os.path.dirname(_d))
 import torch
 import torch.nn.functional as F
 from torch import Tensor
