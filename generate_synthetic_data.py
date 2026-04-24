@@ -23,11 +23,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sys, os as _os
-_diffusion_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "diffusion")
-if _diffusion_dir not in sys.path:
-    sys.path.insert(0, _diffusion_dir)
+# Add diffusion/ to path so its internal imports resolve correctly
+_root = os.path.dirname(os.path.abspath(__file__))
+_diff = os.path.join(_root, "diffusion")
+for _p in [_root, _diff]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from diffusion.generate import TrajectoryGenerator, GenerationConfig
 from reward_computer import RewardComputer
 
@@ -45,7 +47,7 @@ ENV_REGISTRY = {
 
 def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
                              nfe=20, cfg_scale=1.5, output_dir="./data/synthetic",
-                             device=None):
+                             device=None, force_env=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,8 +79,9 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
 
     gen_cfg = GenerationConfig(nfe=nfe, cfg_scale=cfg_scale, clip_actions=True)
 
-    # Reward computer — analytic for D4RL locomotion, no diffusion needed
-    reward_computer = RewardComputer.make(env, device=device)
+    # Reward computer — use force_env if specified (overrides checkpoint detection)
+    reward_env = force_env if force_env else env
+    reward_computer = RewardComputer.make(reward_env, device=device)
 
     # Load real initial states for conditioning diversity
     real_data_path = f"./data/{env}.npz"
@@ -103,6 +106,7 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
             initial_states=init_states,
             target_return=target_return,
             gen_cfg=gen_cfg,
+            force_env=force_env,
         )
         # Store obs, action, next_obs — rewards computed analytically below
         obs_b     = result["observations"]          # (B, T, obs_dim)
@@ -138,9 +142,13 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
         real     = np.load(real_data_path, allow_pickle=True)
         real_obs = real["observations"].astype(np.float32)
         real_r   = real["rewards"].astype(np.float32)
-        obs_mean = real_obs.mean(axis=0)
-        obs_std  = real_obs.std(axis=0) + 1e-8
-        in_bounds = np.all((obs >= obs_mean - 5*obs_std) & (obs <= obs_mean + 5*obs_std), axis=1)
+        # Use per-dim percentile bounds (more robust than sigma for non-Gaussian obs)
+        obs_lo = np.percentile(real_obs, 0.5, axis=0)
+        obs_hi = np.percentile(real_obs, 99.5, axis=0)
+        # Allow 10% of dims to be OOD (handles ant's 111-dim complexity)
+        max_ood_frac = 0.1
+        n_ood = ((obs < obs_lo) | (obs > obs_hi)).sum(axis=1)
+        in_bounds = (n_ood / obs.shape[1]) <= max_ood_frac
         n_before  = len(obs)
         n_kept    = int(in_bounds.sum())
         print(f"\nOOD filter: kept {n_kept:,}/{n_before:,} ({100*n_kept/n_before:.1f}%)")
@@ -186,6 +194,8 @@ if __name__ == "__main__":
     parser.add_argument("--nfe",           type=int,   default=20)
     parser.add_argument("--cfg_scale",     type=float, default=1.5)
     parser.add_argument("--output_dir",    type=str,   default="./data/synthetic")
+    parser.add_argument("--force_env",     type=str,   default=None,
+                        help="Override env name for reward computer (e.g. walker2d-medium-v2)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -194,4 +204,5 @@ if __name__ == "__main__":
         env=args.env, n_transitions=args.n_transitions,
         batch_size=args.batch_size, nfe=args.nfe,
         cfg_scale=args.cfg_scale, output_dir=args.output_dir, device=device,
+        force_env=args.force_env,
     )

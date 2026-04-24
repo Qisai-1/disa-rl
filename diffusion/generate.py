@@ -133,6 +133,7 @@ class TrajectoryGenerator:
         initial_states: Optional[np.ndarray]       = None,
         target_return:  float                      = 3000.0,
         gen_cfg:        Optional[GenerationConfig] = None,
+        force_env:      Optional[str]              = None,
     ) -> Dict:
         """
         Generate a batch of denormalised trajectories.
@@ -191,11 +192,15 @@ class TrajectoryGenerator:
 
         obs     = trajs_raw[:, :, :obs_dim]
         actions = trajs_raw[:, :, obs_dim:obs_dim + action_dim]
-        # Compute rewards analytically — env detected from checkpoint or obs_dim
-        if not hasattr(self, '_reward_computer'):
+        # Compute rewards analytically
+        # Priority: force_env argument > checkpoint env_name > obs_dim fallback
+        if force_env:
+            if not hasattr(self, '_reward_computer') or                getattr(self, '_forced_env', None) != force_env:
+                self._reward_computer = RewardComputer.make(force_env)
+                self._forced_env = force_env
+        elif not hasattr(self, '_reward_computer'):
             env_name = getattr(self, '_env_name', '')
             if not env_name:
-                # Fallback: guess from obs_dim (ant=111 is unambiguous)
                 if obs_dim == 111:   env_name = "ant-medium-v2"
                 elif obs_dim == 11:  env_name = "hopper-medium-v2"
                 else:                env_name = "halfcheetah-medium-v2"
