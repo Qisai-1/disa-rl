@@ -231,6 +231,34 @@ class GaussianActor(nn.Module):
 
         return action, log_prob
 
+    def log_prob(self, obs: Tensor, action: Tensor) -> Tensor:
+        """
+        Compute log π(action | obs) for given (obs, action) pairs.
+        Used in AWR actor update — evaluates log prob of DATASET actions.
+
+        obs    : (B, obs_dim)
+        action : (B, action_dim) — actions from the dataset (already in [-1,1])
+        Returns: (B,) log probabilities
+        """
+        mean, log_std = self.forward(obs)
+        std = log_std.exp()
+
+        # Inverse tanh to get pre-squash values
+        # action = tanh(x) → x = atanh(action)
+        action_clamped = action.clamp(-1 + 1e-6, 1 - 1e-6)
+        x_t = torch.atanh(action_clamped)
+
+        # Log prob of Gaussian at x_t
+        log_prob = (
+            -0.5 * ((x_t - mean) / std).pow(2)
+            - log_std
+            - 0.5 * math.log(2 * math.pi)
+        ).sum(dim=-1)
+
+        # Tanh correction
+        log_prob -= (2.0 * (math.log(2) - x_t - F.softplus(-2 * x_t))).sum(dim=-1)
+        return log_prob
+
     @torch.no_grad()
     def act(self, obs: Tensor, deterministic: bool = True) -> Tensor:
         """Single action for environment interaction (no grad, deterministic by default)."""

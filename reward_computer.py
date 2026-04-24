@@ -256,30 +256,28 @@ class RewardComputer:
     # Factory
     # ------------------------------------------------------------------
 
-    # Standalone env registry — no dependency on iql/train_iql.py
-    _ENV_DIMS = {
-        "halfcheetah": (17, 6),
-        "hopper":      (11, 3),
-        "walker2d":    (17, 6),
-        "ant":         (111, 8),
-    }
-
     @classmethod
     def make(
         cls,
         env_name:    str,
         use_learned: bool          = False,
         device:      torch.device  = torch.device("cpu"),
+        data_dir:    str           = "./data",
     ) -> "RewardComputer":
-        """Auto-detect obs/action dims from env name and create."""
-        obs_dim, action_dim = None, None
-        for key, dims in cls._ENV_DIMS.items():
-            if key in env_name.lower():
-                obs_dim, action_dim = dims
-                break
-        if obs_dim is None:
-            raise ValueError(f"Unknown env: {env_name}. "
-                             f"Known: {list(cls._ENV_DIMS.keys())}")
+        """
+        Auto-detect obs/action dims from dataset file.
+        Requires the dataset .npz to exist — no hardcoded fallbacks.
+        """
+        import numpy as np
+        data_path = os.path.join(data_dir, f"{env_name}.npz")
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(
+                f"Dataset not found: {data_path}\n"
+                f"Run: python download_data.py --datasets {env_name}"
+            )
+        data       = np.load(data_path, allow_pickle=True)
+        obs_dim    = int(data["observations"].shape[1])
+        action_dim = int(data["actions"].shape[1])
         return cls(env_name, use_learned, obs_dim, action_dim, device)
 
     # ------------------------------------------------------------------

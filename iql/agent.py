@@ -184,11 +184,10 @@ class IQLAgent:
                 adv    = (q_adv - v_adv).detach()
                 weight = torch.exp(self.temperature * adv).clamp(max=100.0)
 
-            _, log_prob = self.actor.get_action(obs)
-            # AWR: maximise E[w(s,a) · log π(a|s)]
-            # The offline actions 'action' are used as the regression targets
-            # via the log_prob of the actor evaluated at those actions
-            _, log_prob_offline = self.actor.get_action(obs)
+            # AWR: maximise E[w(s,a) · log π(a_offline|s)]
+            # Evaluate log probability of DATASET actions under current policy
+            # This regresses the policy toward high-advantage offline actions
+            log_prob_offline = self.actor.log_prob(obs, action)
             actor_loss = -(weight * log_prob_offline).mean()
 
         self.scaler_pi.scale(actor_loss).backward()

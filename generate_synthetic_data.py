@@ -33,16 +33,46 @@ for _p in [_root, _diff]:
 from diffusion.generate import TrajectoryGenerator, GenerationConfig
 from reward_computer import RewardComputer
 
-ENV_REGISTRY = {
-    "halfcheetah-medium-v2":        (17, 6,   "./checkpoints/halfcheetah-medium-v2/diffusion/offline_final.pt",  5000.0),
-    "halfcheetah-medium-replay-v2": (17, 6,   "./checkpoints/halfcheetah-medium-replay-v2/diffusion/offline_final.pt", 4000.0),
-    "hopper-medium-v2":             (11, 3,   "./checkpoints/hopper-medium-v2/diffusion/offline_final.pt",       2000.0),
-    "hopper-medium-replay-v2":      (11, 3,   "./checkpoints/hopper-medium-replay-v2/diffusion/offline_final.pt", 1500.0),
-    "walker2d-medium-v2":           (17, 6,   "./checkpoints/walker2d-medium-v2/diffusion/offline_final.pt",     3000.0),
-    "walker2d-medium-replay-v2":    (17, 6,   "./checkpoints/walker2d-medium-replay-v2/diffusion/offline_final.pt", 2500.0),
-    "ant-medium-v2":                (111, 8,  "./checkpoints/ant-medium-v2/diffusion/offline_final.pt",          3500.0),
-    "ant-medium-replay-v2":         (111, 8,  "./checkpoints/ant-medium-replay-v2/diffusion/offline_final.pt",   3000.0),
-}
+def get_env_info_for_generation(env_name, data_dir="./data", ckpt_dir="./checkpoints"):
+    """
+    Auto-detect all environment info from dataset and checkpoint.
+    No hardcoded dims or target returns.
+    """
+    data_path = os.path.join(data_dir, f"{env_name}.npz")
+    ckpt_path = os.path.join(ckpt_dir, env_name, "diffusion", "offline_final.pt")
+
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Dataset not found: {data_path}")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Diffusion checkpoint not found: {ckpt_path}")
+
+    # Read dims from dataset
+    data     = np.load(data_path, allow_pickle=True)
+    obs_dim  = int(data["observations"].shape[1])
+    act_dim  = int(data["actions"].shape[1])
+
+    # Compute target return as 90th percentile of episode returns
+    rewards   = data["rewards"]
+    terminals = data.get("terminals", np.zeros(len(rewards)))
+    timeouts  = data.get("timeouts",  np.zeros(len(rewards)))
+    done      = (terminals + timeouts) > 0
+
+    ep_returns, ep_ret = [], 0.0
+    for r, d in zip(rewards, done):
+        ep_ret += r
+        if d:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+    if ep_ret > 0:
+        ep_returns.append(ep_ret)
+
+    if not ep_returns:
+        raise ValueError(f"No episode boundaries found in {data_path}. Check terminals/timeouts.")
+    target_return = float(np.percentile(ep_returns, 90))
+    print(f"  Auto-detected: obs={obs_dim}  act={act_dim}  "
+          f"target_return={target_return:.1f} (p90 of {len(ep_returns)} episodes)")
+
+    return obs_dim, act_dim, ckpt_path, target_return
 
 
 def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
@@ -51,7 +81,7 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    obs_dim, action_dim, ckpt_path, target_return = ENV_REGISTRY[env]
+    obs_dim, action_dim, ckpt_path, target_return = get_env_info_for_generation(env)
 
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
@@ -188,7 +218,8 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",           type=str,   required=True, choices=list(ENV_REGISTRY.keys()))
+    parser.add_argument("--env",           type=str,   required=True,
+                        help="D4RL dataset name e.g. halfcheetah-medium-v2")
     parser.add_argument("--n_transitions", type=int,   default=1_000_000)
     parser.add_argument("--batch_size",    type=int,   default=64)
     parser.add_argument("--nfe",           type=int,   default=20)

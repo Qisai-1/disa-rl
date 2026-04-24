@@ -34,28 +34,28 @@ from iql.evaluator import make_evaluator
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Registry
+# Dynamic environment detection — no hardcoded dims
 # ──────────────────────────────────────────────────────────────────────────────
 
-ENV_REGISTRY = {
-    "halfcheetah-medium-v2":        (17,  6,  "./data/halfcheetah-medium-v2.npz"),
-    "halfcheetah-medium-replay-v2": (17,  6,  "./data/halfcheetah-medium-replay-v2.npz"),
-    "halfcheetah-expert-v2":        (17,  6,  "./data/halfcheetah-expert-v2.npz"),
-    "hopper-medium-v2":             (11,  3,  "./data/hopper-medium-v2.npz"),
-    "hopper-medium-replay-v2":      (11,  3,  "./data/hopper-medium-replay-v2.npz"),
-    "hopper-expert-v2":             (11,  3,  "./data/hopper-expert-v2.npz"),
-    "walker2d-medium-v2":           (17,  6,  "./data/walker2d-medium-v2.npz"),
-    "walker2d-medium-replay-v2":    (17,  6,  "./data/walker2d-medium-replay-v2.npz"),
-    "walker2d-expert-v2":           (17,  6,  "./data/walker2d-expert-v2.npz"),
-    "ant-medium-v2":                (111, 8,  "./data/ant-medium-v2.npz"),
-    "ant-medium-replay-v2":         (111, 8,  "./data/ant-medium-replay-v2.npz"),
-}
+def get_env_info(env_name: str, data_dir: str = "./data"):
+    """
+    Read obs_dim and action_dim directly from the .npz file.
+    No hardcoded registry needed — works for any D4RL environment.
+    """
+    import numpy as np
+    data_path = os.path.join(data_dir, f"{env_name}.npz")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            f"Dataset not found: {data_path}\n"
+            f"Run: python download_data.py --datasets {env_name}"
+        )
+    data     = np.load(data_path, allow_pickle=True)
+    obs_dim  = data["observations"].shape[1]
+    act_dim  = data["actions"].shape[1]
+    return obs_dim, act_dim, data_path
 
-# Default synthetic data paths (produced by generate_synthetic_data.py)
-SYNTHETIC_PATHS = {
-    env: f"./data/synthetic/{env}/synthetic_transitions.npz"
-    for env in ENV_REGISTRY
-}
+def get_synthetic_path(env_name: str) -> str:
+    return f"./data/synthetic/{env_name}/synthetic_transitions.npz"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ def train_iql(args) -> None:
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    obs_dim, action_dim, data_path = ENV_REGISTRY[args.env]
+    obs_dim, action_dim, data_path = get_env_info(args.env)
 
     # ── Agent ─────────────────────────────────────────────────────────────
     agent = IQLAgent(
@@ -91,7 +91,7 @@ def train_iql(args) -> None:
     alpha = 1.0  # default: pure real
 
     if args.mode == "augmented":
-        syn_path = args.synthetic_data or SYNTHETIC_PATHS[args.env]
+        syn_path = args.synthetic_data or get_synthetic_path(args.env)
         if os.path.exists(syn_path):
             synthetic_buffer = SyntheticBuffer(syn_path, device)
             alpha = args.alpha
@@ -118,7 +118,7 @@ def train_iql(args) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     wandb.init(
-        project = "disa-rl",
+        project = args.wandb_project,
         name    = run_name,
         mode    = os.environ.get("WANDB_MODE", "online"),
         config  = dict(
@@ -185,7 +185,7 @@ def train_iql(args) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IQL offline RL")
-    parser.add_argument("--env",  type=str, required=True, choices=list(ENV_REGISTRY.keys()))
+    parser.add_argument("--env",  type=str, required=True, help="D4RL dataset name e.g. halfcheetah-medium-v2")
     parser.add_argument("--mode", type=str, default="augmented",
                         choices=["offline_only", "augmented"])
     parser.add_argument("--synthetic_data", type=str, default=None,
@@ -197,6 +197,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every", type=int,   default=10_000)
     parser.add_argument("--log_every",  type=int,   default=1_000)
     parser.add_argument("--save_every", type=int,   default=100_000)
-    parser.add_argument("--seed",       type=int,   default=0)
+    parser.add_argument("--seed",        type=int,   default=0)
+    parser.add_argument("--wandb_project", type=str, default="disa-rl",
+                        help="WandB project name")
     args = parser.parse_args()
     train_iql(args)

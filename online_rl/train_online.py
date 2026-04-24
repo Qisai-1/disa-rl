@@ -46,27 +46,40 @@ from iql.evaluator import make_evaluator
 # Environment registry
 # ──────────────────────────────────────────────────────────────────────────────
 
-ENV_REGISTRY = {
-    "halfcheetah-medium-v2":        (17,  6),
-    "halfcheetah-medium-replay-v2": (17,  6),
-    "hopper-medium-v2":             (11,  3),
-    "hopper-medium-replay-v2":      (11,  3),
-    "walker2d-medium-v2":           (17,  6),
-    "walker2d-medium-replay-v2":    (17,  6),
-    "ant-medium-v2":                (111, 8),
-    "ant-medium-replay-v2":         (111, 8),
-}
+def get_env_dims(env_name: str, data_dir: str = "./data"):
+    """Read obs_dim and action_dim directly from dataset — no hardcoded registry."""
+    import numpy as np
+    path = os.path.join(data_dir, f"{env_name}.npz")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    data = np.load(path, allow_pickle=True)
+    return int(data["observations"].shape[1]), int(data["actions"].shape[1])
 
-TARGET_RETURNS = {
-    "halfcheetah-medium-v2":        5000.0,
-    "hopper-medium-v2":             2000.0,
-    "walker2d-medium-v2":           3000.0,
-    "ant-medium-v2":                3500.0,
-    "halfcheetah-medium-replay-v2": 4000.0,
-    "hopper-medium-replay-v2":      1500.0,
-    "walker2d-medium-replay-v2":    2500.0,
-    "ant-medium-replay-v2":         3000.0,
-}
+def get_target_return(env_name: str, data_dir: str = "./data", percentile: int = 90) -> float:
+    """Compute target return as p90 of episode returns from real dataset."""
+    import numpy as np
+    path = os.path.join(data_dir, f"{env_name}.npz")
+    if not os.path.exists(path):
+        return 3000.0  # fallback
+    data      = np.load(path, allow_pickle=True)
+    rewards   = data["rewards"]
+    terminals = data.get("terminals", np.zeros(len(rewards)))
+    timeouts  = data.get("timeouts",  np.zeros(len(rewards)))
+    done      = (terminals + timeouts) > 0
+    ep_returns, ep_ret = [], 0.0
+    for r, d in zip(rewards, done):
+        ep_ret += r
+        if d:
+            ep_returns.append(ep_ret)
+            ep_ret = 0.0
+    if ep_ret > 0:
+        ep_returns.append(ep_ret)
+    if not ep_returns:
+        raise ValueError(
+            f"Could not compute episode returns from {path}. "
+            f"Check that terminals/timeouts mark episode boundaries."
+        )
+    return float(np.percentile(ep_returns, percentile))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,7 +188,7 @@ def train_online(args) -> None:
     np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    obs_dim, action_dim = ENV_REGISTRY[args.env]
+    obs_dim, action_dim = get_env_dims(args.env)
 
     # ── SAC Agent ─────────────────────────────────────────────────────────
     agent = SACAgent(
@@ -224,7 +237,7 @@ def train_online(args) -> None:
         async_gen = AsyncSyntheticGenerator(
             ckpt_path      = args.diffusion_ckpt,
             env_name       = args.env,
-            target_return  = TARGET_RETURNS.get(args.env, 3000.0),
+            target_return  = get_target_return(args.env),
             batch_size     = 32,
             nfe            = args.nfe,
             cfg_scale      = 1.5,
@@ -402,7 +415,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="DiSA-RL online training")
     parser.add_argument("--env",  type=str, required=True,
-                        choices=list(ENV_REGISTRY.keys()))
+                        help="D4RL dataset name e.g. halfcheetah-medium-v2")
     parser.add_argument("--iql_ckpt", type=str, default=None,
                         help="Path to offline IQL checkpoint (best.pt)")
     parser.add_argument("--diffusion_ckpt", type=str, default=None,
