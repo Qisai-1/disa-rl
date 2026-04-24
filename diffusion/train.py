@@ -525,6 +525,14 @@ if __name__ == "__main__":
         "--wandb_entity", type=str, default="",
         help="WandB username/team.",
     )
+    parser.add_argument(
+        "--patience", type=int, default=None,
+        help="Early stopping patience (overrides config default of 10).",
+    )
+    parser.add_argument(
+        "--min_delta", type=float, default=None,
+        help="Early stopping min improvement (overrides config default of 1e-4).",
+    )
     args = parser.parse_args()
 
     if args.env not in ENV_REGISTRY:
@@ -555,6 +563,8 @@ if __name__ == "__main__":
         ),
         training = TrainingConfig(
             batch_size   = args.batch_size,
+            patience     = args.patience  if args.patience  is not None else 10,
+            min_delta    = args.min_delta if args.min_delta is not None else 1e-4,
             lr           = args.lr if args.lr is not None else 1e-4,
             weight_decay = 1e-4,
             num_steps    = args.num_steps,
