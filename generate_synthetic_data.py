@@ -24,7 +24,11 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from generate import TrajectoryGenerator, GenerationConfig
+import sys, os as _os
+_diffusion_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "diffusion")
+if _diffusion_dir not in sys.path:
+    sys.path.insert(0, _diffusion_dir)
+from diffusion.generate import TrajectoryGenerator, GenerationConfig
 from reward_computer import RewardComputer
 
 ENV_REGISTRY = {
