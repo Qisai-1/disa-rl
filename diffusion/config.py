@@ -67,7 +67,7 @@ class TrainingConfig:
     save_every:   int   = 10_000
     log_every:    int   = 100
     val_every:    int   = 2_000
-    num_workers:  int   = 4
+    num_workers:  int   = 0
     patience:     int   = 10       # early stop after N val checks without improvement
     min_delta:    float = 1e-4     # min improvement to reset patience
 

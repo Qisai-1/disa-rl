@@ -205,7 +205,7 @@ def train_offline(
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.training.batch_size,
-        shuffle=False, num_workers=2, pin_memory=True,
+        shuffle=False, num_workers=0, pin_memory=False,
     )
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -412,11 +412,11 @@ def finetune_online(
     if offline_dataset is not None and replay_fraction > 0:
         combined = ConcatDataset([new_trajs_dataset, offline_dataset])
         loader   = DataLoader(combined, batch_size=cfg.training.batch_size,
-                              shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+                              shuffle=True, num_workers=0, pin_memory=False, drop_last=True)
         print(f"Fine-tuning with {replay_fraction:.0%} offline replay.")
     else:
         loader = DataLoader(new_trajs_dataset, batch_size=min(64, len(new_trajs_dataset)),
-                           shuffle=True, num_workers=2, pin_memory=True, drop_last=False)
+                           shuffle=True, num_workers=0, pin_memory=False, drop_last=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
@@ -574,7 +574,7 @@ if __name__ == "__main__":
             save_every   = 10_000,
             log_every    = 100,
             val_every    = 2_000,
-            num_workers  = 4,
+            num_workers  = 0,
         ),
         data = DataConfig(
             dataset_name      = args.env,
