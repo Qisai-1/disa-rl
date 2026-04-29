@@ -90,7 +90,10 @@ class Evaluator:
     def _make_env(self):
         try:
             import gymnasium as gym
-            env = gym.make(self.env_name)
+            if "ant" in self.env_name.lower() or "Ant" in self.env_name:
+                env = gym.make(self.env_name, use_contact_forces=True)
+            else:
+                env = gym.make(self.env_name)
             print(f"Evaluator: {self.env_name}  obs={env.observation_space.shape}  "
                   f"act={env.action_space.shape}")
             return env
