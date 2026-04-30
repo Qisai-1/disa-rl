@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:h200:4
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=4
-#SBATCH --mem=120G
+#SBATCH --mem=64G
 #SBATCH --job-name="disa_iql"
 #SBATCH --account=mech-ai
 #SBATCH --mail-user=supersai@iastate.edu
@@ -31,17 +31,16 @@ cd $DISA
 mkdir -p logs/slurm
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate disa
+conda activate /work/mech-ai-scratch/supersai/.conda/envs/disa
 
 ENVS=("halfcheetah-medium-v2" "hopper-medium-v2" "walker2d-medium-v2" "ant-medium-v2")
 SEEDS=(0 1 2 3 4)
 
-# Each GPU handles one environment, all 5 seeds in parallel
-# IQL is small (~256MB VRAM) so 5 seeds fit on one A100 easily
+# 4 GPUs — one env per GPU, all 5 seeds in parallel per GPU
+# IQL uses ~500MB VRAM per seed → 5 seeds = ~2.5GB per H200 (141GB) — plenty
 for i in "${!ENVS[@]}"; do
     ENV="${ENVS[$i]}"
 
-    # Determine mode
     SYN="./data/synthetic/$ENV/synthetic_transitions.npz"
     if [[ -f "$SYN" ]]; then
         MODE="augmented"
@@ -53,11 +52,12 @@ for i in "${!ENVS[@]}"; do
     echo "GPU $i → $ENV ($MODE) seeds 0-4"
 
     for seed in "${SEEDS[@]}"; do
-        CUDA_VISIBLE_DEVICES=$i WANDB_MODE=offline python iql/train_iql.py \
+        CUDA_VISIBLE_DEVICES=$i python iql/train_iql.py \
             --env       "$ENV" \
             --mode      "$MODE" \
             --seed      "$seed" \
             --num_steps 1000000 \
+            --wandb_project disa-rl \
             >> "logs/slurm/iql_${ENV}_s${seed}_${SLURM_JOB_ID}.log" 2>&1 &
     done
 done

@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --time=72:00:00
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:l40s:4
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=4
-#SBATCH --mem=120G
+#SBATCH --mem=44G
 #SBATCH --job-name="disa_diffusion"
 #SBATCH --account=mech-ai
 #SBATCH --mail-user=supersai@iastate.edu
@@ -31,7 +31,7 @@ cd $DISA
 mkdir -p logs/slurm
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate disa
+conda activate /work/mech-ai-scratch/supersai/.conda/envs/disa
 
 # Train all 4 environments simultaneously, one per GPU
 ENVS=("halfcheetah-medium-v2" "hopper-medium-v2" "walker2d-medium-v2" "ant-medium-v2")
@@ -43,7 +43,7 @@ for i in "${!ENVS[@]}"; do
         --env        "$ENV" \
         --batch_size 256 \
         --lr         1e-4 \
-        --patience   20 \
+        --patience   100 \
         --num_steps  300000 \
         >> "logs/slurm/diffusion_${ENV}_${SLURM_JOB_ID}.log" 2>&1 &
 done

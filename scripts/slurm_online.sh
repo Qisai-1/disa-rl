@@ -31,7 +31,7 @@ cd $DISA
 mkdir -p logs/slurm
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate disa
+conda activate /work/mech-ai-scratch/supersai/.conda/envs/disa
 
 ENVS=("halfcheetah-medium-v2" "hopper-medium-v2" "walker2d-medium-v2" "ant-medium-v2")
 SEEDS=(0 1 2 3 4)

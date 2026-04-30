@@ -17,9 +17,11 @@ class ModelConfig:
     trajectory_length: int = 100     # T: sub-trajectory length
 
     # Architecture
-    hidden_size: int   = 512
-    depth:       int   = 8
-    num_heads:   int   = 8           # hidden_size % num_heads == 0
+    # Reduced from 512/8/8 (39M) to 256/6/4 (5M)
+    # 19k training trajectories cannot support 39M params — severe overfitting
+    hidden_size: int   = 256
+    depth:       int   = 6
+    num_heads:   int   = 4           # hidden_size % num_heads == 0
     mlp_ratio:   float = 4.0
 
     # RoPE
@@ -29,7 +31,7 @@ class ModelConfig:
     # Conditioning
     use_return_cond:  bool  = True
     cfg_dropout_prob: float = 0.10
-    mlp_dropout:      float = 0.1    # MLP dropout — regularises 39M param model on small dataset
+    mlp_dropout:      float = 0.3    # increased from 0.1 — stronger regularization
 
     @property
     def feature_dim(self) -> int:
@@ -59,7 +61,7 @@ class LossConfig:
 class TrainingConfig:
     batch_size:   int   = 256
     lr:           float = 1e-4
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-3   # increased from 1e-4 — stronger regularization
     num_steps:    int   = 300_000
     grad_clip:    float = 1.0
     ema_decay:    float = 0.9999
