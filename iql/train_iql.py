@@ -93,7 +93,8 @@ def train_iql(args) -> None:
     if args.mode == "augmented":
         syn_path = args.synthetic_data or get_synthetic_path(args.env)
         if os.path.exists(syn_path):
-            synthetic_buffer = SyntheticBuffer(syn_path, device)
+            synthetic_buffer = SyntheticBuffer(syn_path, device,
+                                                     max_transitions=args.n_synthetic)
             alpha = args.alpha
         else:
             print(f"\nWARNING: Synthetic data not found at {syn_path}")
@@ -113,8 +114,9 @@ def train_iql(args) -> None:
 
     # ── WandB ─────────────────────────────────────────────────────────────
     env_tag    = args.env.replace("-v2", "").replace("-", "_")
-    run_name   = f"iql_{env_tag}_{args.mode}_s{args.seed}"
-    output_dir = os.path.join("./checkpoints", args.env, "iql", args.mode, f"seed_{args.seed}")
+    syn_tag  = f"_syn{args.n_synthetic//1000}k" if args.n_synthetic else ""
+    run_name = f"iql_{env_tag}_{args.mode}_alpha{args.alpha}_s{args.seed}"
+    output_dir = os.path.join("./checkpoints", args.env, "iql", args.mode)
     os.makedirs(output_dir, exist_ok=True)
 
     wandb.init(
@@ -127,7 +129,8 @@ def train_iql(args) -> None:
             seed       = args.seed,
             num_steps  = args.num_steps,
             batch_size = args.batch_size,
-            alpha      = alpha,
+            alpha       = alpha,
+            n_synthetic = args.n_synthetic,
         ),
     )
 
@@ -190,6 +193,8 @@ if __name__ == "__main__":
                         choices=["offline_only", "augmented"])
     parser.add_argument("--synthetic_data", type=str, default=None,
                         help="Path to pre-generated synthetic .npz (auto-detected if None)")
+    parser.add_argument("--n_synthetic",  type=int,   default=None,
+                        help="Max synthetic transitions to use e.g. 100000")
     parser.add_argument("--alpha",      type=float, default=0.5,
                         help="Fraction of real data (0.5 = 50% real, 50% synthetic)")
     parser.add_argument("--num_steps",  type=int,   default=1_000_000)
