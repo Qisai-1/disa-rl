@@ -90,6 +90,8 @@ class Evaluator:
     def _make_env(self):
         try:
             import gymnasium as gym
+            # Ant-v4 in gymnasium has obs_dim=27 by default but D4RL ant
+            # uses obs_dim=111 (includes contact forces). Must match dataset.
             if "ant" in self.env_name.lower() or "Ant" in self.env_name:
                 env = gym.make(self.env_name, use_contact_forces=True)
             else:
