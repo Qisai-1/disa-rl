@@ -124,7 +124,7 @@ def train_iql(args) -> None:
     env_tag  = args.env.replace("-v2", "").replace("-", "_")
     run_name = f"iql_{env_tag}_{args.mode}_alpha{args.alpha}_s{args.seed}"
     output_dir = os.path.join("./checkpoints", args.env, "iql", args.mode,
-                               f"seed_{args.seed}")
+                               f"alpha{args.alpha}", f"seed_{args.seed}")
     os.makedirs(output_dir, exist_ok=True)
 
     wandb.init(
