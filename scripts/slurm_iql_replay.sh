@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:rtx_6000:4
+#SBATCH --gres=gpu:a100:4
 #SBATCH --cpus-per-task=4
 #SBATCH --ntasks=4
 #SBATCH --mem=120G
