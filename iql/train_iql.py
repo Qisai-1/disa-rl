@@ -13,8 +13,14 @@ Usage:
     # Baseline
     python iql/train_iql.py --env halfcheetah-medium-v2 --mode offline_only --seed 0
 
-    # DiSA-RL augmented
-    python iql/train_iql.py --env halfcheetah-medium-v2 --mode augmented --seed 0
+    # DiSA-RL augmented (50% real, 50% synthetic)
+    python iql/train_iql.py --env halfcheetah-medium-v2 --mode augmented --alpha 0.5 --seed 0
+
+    # DiSA-RL augmented (25% real, 75% synthetic)
+    python iql/train_iql.py --env halfcheetah-medium-v2 --mode augmented --alpha 0.25 --seed 0
+
+    # DiSA-RL augmented (100% synthetic)
+    python iql/train_iql.py --env halfcheetah-medium-v2 --mode augmented --alpha 0.0 --seed 0
 """
 
 from __future__ import annotations
@@ -42,16 +48,15 @@ def get_env_info(env_name: str, data_dir: str = "./data"):
     Read obs_dim and action_dim directly from the .npz file.
     No hardcoded registry needed — works for any D4RL environment.
     """
-    import numpy as np
     data_path = os.path.join(data_dir, f"{env_name}.npz")
     if not os.path.exists(data_path):
         raise FileNotFoundError(
             f"Dataset not found: {data_path}\n"
             f"Run: python download_data.py --datasets {env_name}"
         )
-    data     = np.load(data_path, allow_pickle=True)
-    obs_dim  = data["observations"].shape[1]
-    act_dim  = data["actions"].shape[1]
+    data    = np.load(data_path, allow_pickle=True)
+    obs_dim = data["observations"].shape[1]
+    act_dim = data["actions"].shape[1]
     return obs_dim, act_dim, data_path
 
 def get_synthetic_path(env_name: str) -> str:
@@ -70,6 +75,8 @@ def train_iql(args) -> None:
     obs_dim, action_dim, data_path = get_env_info(args.env)
 
     # ── Agent ─────────────────────────────────────────────────────────────
+    # bc_weight: BC anchor on real data only, keeps policy from chasing
+    # unreachable synthetic states. Disabled for offline_only mode.
     agent = IQLAgent(
         obs_dim     = obs_dim,
         action_dim  = action_dim,
@@ -81,6 +88,7 @@ def train_iql(args) -> None:
         lr_q        = 3e-4,
         lr_v        = 3e-4,
         lr_pi       = 3e-4,
+        bc_weight   = args.bc_weight,   # ← NEW: BC anchor weight
         device      = device,
     )
 
@@ -94,7 +102,7 @@ def train_iql(args) -> None:
         syn_path = args.synthetic_data or get_synthetic_path(args.env)
         if os.path.exists(syn_path):
             synthetic_buffer = SyntheticBuffer(syn_path, device,
-                                                     max_transitions=args.n_synthetic)
+                                               return_weighting=True)  # ← NEW
             alpha = args.alpha
         else:
             print(f"\nWARNING: Synthetic data not found at {syn_path}")
@@ -113,10 +121,10 @@ def train_iql(args) -> None:
     evaluator = make_evaluator(args.env, device, n_episodes=10)
 
     # ── WandB ─────────────────────────────────────────────────────────────
-    env_tag    = args.env.replace("-v2", "").replace("-", "_")
-    syn_tag  = f"_syn{args.n_synthetic//1000}k" if args.n_synthetic else ""
+    env_tag  = args.env.replace("-v2", "").replace("-", "_")
     run_name = f"iql_{env_tag}_{args.mode}_alpha{args.alpha}_s{args.seed}"
-    output_dir = os.path.join("./checkpoints", args.env, "iql", args.mode)
+    output_dir = os.path.join("./checkpoints", args.env, "iql", args.mode,
+                               f"seed_{args.seed}")
     os.makedirs(output_dir, exist_ok=True)
 
     wandb.init(
@@ -129,8 +137,8 @@ def train_iql(args) -> None:
             seed       = args.seed,
             num_steps  = args.num_steps,
             batch_size = args.batch_size,
-            alpha       = alpha,
-            n_synthetic = args.n_synthetic,
+            alpha      = alpha,
+            bc_weight  = args.bc_weight,
         ),
     )
 
@@ -138,6 +146,7 @@ def train_iql(args) -> None:
     print(f"  IQL: {args.env}")
     print(f"  Mode      : {args.mode}")
     print(f"  Alpha     : {alpha:.2f}  ({'pure real' if alpha >= 1.0 else f'{(1-alpha)*100:.0f}% synthetic'})")
+    print(f"  BC weight : {args.bc_weight}")
     print(f"  Steps     : {args.num_steps:,}")
     print(f"  Output    : {output_dir}/")
     print(f"{'='*55}\n")
@@ -147,8 +156,16 @@ def train_iql(args) -> None:
     pbar = tqdm(total=args.num_steps, desc=f"IQL [{args.mode}] seed={args.seed}")
 
     for step in range(1, args.num_steps + 1):
-        batch   = aug_buffer.sample(args.batch_size)
-        metrics = agent.update(batch)
+        batch = aug_buffer.sample(args.batch_size)
+
+        # BC anchor: pass real_batch so actor stays close to real distribution.
+        # Only used in augmented mode with bc_weight > 0.
+        # In offline_only mode real_batch=None → standard AWR only.
+        real_batch = aug_buffer.sample_real(args.batch_size) \
+                     if args.mode == "augmented" and args.bc_weight > 0 \
+                     else None
+
+        metrics = agent.update(batch, real_batch=real_batch)  # ← NEW
 
         if step % args.log_every == 0:
             metrics["step"] = step
@@ -188,21 +205,22 @@ def train_iql(args) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IQL offline RL")
-    parser.add_argument("--env",  type=str, required=True, help="D4RL dataset name e.g. halfcheetah-medium-v2")
+    parser.add_argument("--env",  type=str, required=True,
+                        help="D4RL dataset name e.g. halfcheetah-medium-v2")
     parser.add_argument("--mode", type=str, default="augmented",
                         choices=["offline_only", "augmented"])
     parser.add_argument("--synthetic_data", type=str, default=None,
-                        help="Path to pre-generated synthetic .npz (auto-detected if None)")
-    parser.add_argument("--n_synthetic",  type=int,   default=None,
-                        help="Max synthetic transitions to use e.g. 100000")
+                        help="Path to synthetic .npz (auto-detected if None)")
     parser.add_argument("--alpha",      type=float, default=0.5,
-                        help="Fraction of real data (0.5 = 50% real, 50% synthetic)")
+                        help="Fraction of real data (0.5=50%% real, 0.0=100%% synthetic)")
+    parser.add_argument("--bc_weight",  type=float, default=0.1,
+                        help="BC anchor weight on real data (0.0 = disabled)")
     parser.add_argument("--num_steps",  type=int,   default=1_000_000)
     parser.add_argument("--batch_size", type=int,   default=256)
     parser.add_argument("--eval_every", type=int,   default=10_000)
     parser.add_argument("--log_every",  type=int,   default=1_000)
     parser.add_argument("--save_every", type=int,   default=100_000)
-    parser.add_argument("--seed",        type=int,   default=0)
+    parser.add_argument("--seed",       type=int,   default=0)
     parser.add_argument("--wandb_project", type=str, default="disa-rl",
                         help="WandB project name")
     args = parser.parse_args()
