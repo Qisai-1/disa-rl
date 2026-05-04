@@ -1,22 +1,25 @@
 """
 Replay buffers for DiSA-RL offline training.
 
-DiSA-RL improvements over standard buffer:
+DiSA-RL improvements:
 
 1. Return-weighted synthetic sampling:
    Transitions from high-return synthetic episodes are sampled more
    frequently. This biases learning toward the best synthetic behavior
    rather than treating all synthetic transitions equally.
 
-2. Separate real batch access:
-   AugmentedReplayBuffer.sample_real() returns a batch of ONLY real
-   transitions — used by the BC anchor in agent.py.
+2. Reward normalization for synthetic data:
+   Synthetic rewards are normalized to match real data distribution.
+   This prevents Q-value miscalibration caused by OOD synthetic rewards
+   (e.g. synthetic mean=9.5 vs real mean=4.77).
 
-Buffer types:
-  ReplayBuffer          — real D4RL transitions from .npz
-  SyntheticBuffer       — pre-generated synthetic transitions with
-                          return-weighted sampling
-  AugmentedReplayBuffer — mixes real + synthetic at ratio alpha
+3. Reward-based OOD filtering:
+   Synthetic transitions with rewards far outside the real data range
+   are discarded before training begins.
+
+4. Separate real batch access:
+   AugmentedReplayBuffer.sample_real() returns ONLY real transitions
+   — used by the BC anchor in agent.py.
 """
 
 from __future__ import annotations
@@ -57,9 +60,14 @@ class ReplayBuffer:
         self.done     = done
         self.size     = len(obs)
 
+        # Store real reward stats for synthetic normalization
+        self.reward_mean = float(rewards.mean())
+        self.reward_std  = float(rewards.std() + 1e-8)
+
         print(f"ReplayBuffer (real)  : {self.size:,} transitions  "
               f"obs={obs.shape}  act={actions.shape}  "
-              f"r=[{rewards.min():.2f}, {rewards.max():.2f}]")
+              f"r=[{rewards.min():.2f}, {rewards.max():.2f}]  "
+              f"mean={self.reward_mean:.3f}  std={self.reward_std:.3f}")
 
     def sample(self, batch_size: int) -> Dict[str, Tensor]:
         idx = np.random.randint(0, self.size, size=batch_size)
@@ -77,65 +85,104 @@ class ReplayBuffer:
 
 class SyntheticBuffer:
     """
-    Pre-generated synthetic transition buffer with return-weighted sampling.
+    Pre-generated synthetic transition buffer.
 
-    DiSA-RL improvement: transitions from high-return synthetic episodes
-    are sampled proportionally more often than low-return ones.
-    This means the policy learns from the BEST synthetic behavior,
-    not an average of all synthetic transitions.
+    Improvements:
+    1. Reward normalization — scales synthetic rewards to match real distribution
+    2. OOD reward filter — removes transitions with unrealistic rewards
+    3. Return-weighted sampling — high-return episodes sampled more often
 
     Parameters
     ----------
     data_path        : path to synthetic_transitions.npz
     device           : torch device
+    real_reward_mean : mean of real data rewards (for normalization)
+    real_reward_std  : std of real data rewards (for normalization)
+    normalize_rewards: if True, normalize synthetic rewards to match real
+    filter_sigma     : remove transitions outside ±N sigma of real reward
+                       (None = no filtering)
     return_weighting : if True, sample proportional to episode return
-    temperature      : β for softmax weighting (lower = more uniform)
+    temperature      : β for softmax return weighting
     """
 
     def __init__(
         self,
-        data_path:        str,
-        device:           torch.device,
-        return_weighting: bool  = True,
-        temperature:      float = 1.0,
+        data_path:         str,
+        device:            torch.device,
+        real_reward_mean:  float = 0.0,
+        real_reward_std:   float = 1.0,
+        normalize_rewards: bool  = True,
+        filter_sigma:      Optional[float] = 3.0,
+        return_weighting:  bool  = True,
+        temperature:       float = 1.0,
     ):
         self.device = device
         data = np.load(data_path, allow_pickle=True)
 
-        self.obs      = data["observations"].astype(np.float32)
-        self.actions  = data["actions"].astype(np.float32)
-        self.rewards  = data["rewards"].astype(np.float32)
-        self.next_obs = data["next_observations"].astype(np.float32)
-        self.done     = data["terminals"].astype(np.float32)
-        self.size     = len(self.obs)
+        obs      = data["observations"].astype(np.float32)
+        actions  = data["actions"].astype(np.float32)
+        rewards  = data["rewards"].astype(np.float32)
+        next_obs = data["next_observations"].astype(np.float32)
+        done     = data["terminals"].astype(np.float32)
 
-        # ── Return-weighted sampling ───────────────────────────────────────
-        # Compute per-transition weight based on the episode return it belongs to.
-        # Transitions in high-return episodes are sampled more often.
+        n_original = len(obs)
+
+        # ── Step 1: OOD reward filter ──────────────────────────────────────
+        # Remove transitions with rewards far outside the real data range.
+        # These correspond to physically impossible states.
+        if filter_sigma is not None:
+            r_min = real_reward_mean - filter_sigma * real_reward_std
+            r_max = real_reward_mean + filter_sigma * real_reward_std
+            mask  = (rewards >= r_min) & (rewards <= r_max)
+            keep  = np.where(mask)[0]
+
+            if len(keep) > 0:
+                obs      = obs[keep]
+                actions  = actions[keep]
+                rewards  = rewards[keep]
+                next_obs = next_obs[keep]
+                done     = done[keep]
+                pct = 100 * len(keep) / n_original
+                print(f"  OOD filter (±{filter_sigma}σ): kept "
+                      f"{len(keep):,}/{n_original:,} ({pct:.1f}%)")
+            else:
+                print(f"  OOD filter: ALL transitions filtered — "
+                      f"syn reward range [{rewards.min():.2f}, {rewards.max():.2f}] "
+                      f"vs real range [{r_min:.2f}, {r_max:.2f}]")
+                print(f"  Disabling filter and using reward normalization only.")
+
+        # ── Step 2: Reward normalization ───────────────────────────────────
+        # Scale synthetic rewards to match real reward distribution.
+        # This prevents Q-value miscalibration even if synthetic rewards
+        # are slightly off.
+        if normalize_rewards and real_reward_std > 0:
+            syn_mean = float(rewards.mean())
+            syn_std  = float(rewards.std() + 1e-8)
+            rewards  = (rewards - syn_mean) / syn_std * real_reward_std + real_reward_mean
+            print(f"  Reward normalization: "
+                  f"syn [{syn_mean:.3f}±{syn_std:.3f}] → "
+                  f"real [{real_reward_mean:.3f}±{real_reward_std:.3f}]")
+
+        self.obs      = obs
+        self.actions  = actions
+        self.rewards  = rewards
+        self.next_obs = next_obs
+        self.done     = done
+        self.size     = len(obs)
+
+        # ── Step 3: Return-weighted sampling ──────────────────────────────
         self._weights = None
-        if return_weighting:
+        if return_weighting and self.size > 0:
             self._weights = self._compute_weights(temperature)
-            print(f"SyntheticBuffer      : {self.size:,} transitions  "
-                  f"obs={self.obs.shape}  "
-                  f"r=[{self.rewards.min():.2f}, {self.rewards.max():.2f}]  "
-                  f"[return-weighted sampling]")
-        else:
-            print(f"SyntheticBuffer      : {self.size:,} transitions  "
-                  f"obs={self.obs.shape}  "
-                  f"r=[{self.rewards.min():.2f}, {self.rewards.max():.2f}]")
+
+        print(f"SyntheticBuffer      : {self.size:,} transitions  "
+              f"r=[{self.rewards.min():.2f}, {self.rewards.max():.2f}]  "
+              f"mean={self.rewards.mean():.3f}  "
+              f"{'[weighted]' if self._weights is not None else ''}")
 
     def _compute_weights(self, temperature: float) -> np.ndarray:
-        """
-        Compute per-transition sampling weights based on episode return.
-
-        Algorithm:
-        1. Split transitions into episodes using done flags
-        2. Compute total return per episode
-        3. Softmax over episode returns → episode weights
-        4. Assign each transition the weight of its episode
-        """
-        weights   = np.ones(self.size, dtype=np.float32)
-        ep_start  = 0
+        weights    = np.ones(self.size, dtype=np.float32)
+        ep_start   = 0
         ep_returns = []
         ep_ranges  = []
 
@@ -149,24 +196,21 @@ class SyntheticBuffer:
         if len(ep_returns) == 0:
             return weights
 
-        # Softmax over episode returns
-        ep_returns = np.array(ep_returns)
-        # Normalize before softmax for numerical stability
+        ep_returns      = np.array(ep_returns)
         ep_returns_norm = (ep_returns - ep_returns.mean()) / (ep_returns.std() + 1e-8)
-        ep_weights = np.exp(ep_returns_norm / temperature)
-        ep_weights = ep_weights / ep_weights.sum()
+        ep_weights      = np.exp(ep_returns_norm / temperature)
+        ep_weights      = ep_weights / ep_weights.sum()
 
-        # Assign episode weight to each transition
         for (start, end), w in zip(ep_ranges, ep_weights):
-            weights[start:end] = w * (end - start)  # scale by ep length
+            weights[start:end] = w * (end - start)
 
-        # Normalize to sum to 1
-        weights = weights / weights.sum()
-        return weights
+        return weights / weights.sum()
 
     def sample(self, batch_size: int) -> Dict[str, Tensor]:
+        if self.size == 0:
+            raise RuntimeError("SyntheticBuffer is empty after filtering")
+
         if self._weights is not None:
-            # Return-weighted sampling
             idx = np.random.choice(self.size, size=batch_size,
                                    replace=True, p=self._weights)
         else:
@@ -188,15 +232,8 @@ class AugmentedReplayBuffer:
     """
     Mixes real D4RL transitions with pre-generated synthetic transitions.
 
-    DiSA-RL improvements:
-    1. sample() returns mixed batch for Q/V learning
-    2. sample_real() returns ONLY real transitions for BC anchor
-
-    Parameters
-    ----------
-    real_buffer      : ReplayBuffer of real D4RL data
-    synthetic_buffer : SyntheticBuffer (None = pure real)
-    alpha            : fraction of real data (0.5 = 50% real, 50% synthetic)
+    sample()      → mixed batch for Q/V/actor training
+    sample_real() → real-only batch for BC anchor
     """
 
     def __init__(
@@ -209,9 +246,15 @@ class AugmentedReplayBuffer:
         self.synthetic = synthetic_buffer
         self.alpha     = float(np.clip(alpha, 0.0, 1.0))
 
-        if synthetic_buffer is not None:
+        # If synthetic buffer is empty after filtering, fall back to pure real
+        if synthetic_buffer is not None and len(synthetic_buffer) == 0:
+            print("AugmentedReplayBuffer: synthetic buffer empty — using pure real")
+            self.synthetic = None
+            self.alpha     = 1.0
+
+        if self.synthetic is not None:
             print(f"AugmentedReplayBuffer: alpha={self.alpha:.2f}  "
-                  f"({(1-self.alpha)*100:.0f}% synthetic)")
+                  f"({self.alpha*100:.0f}% real + {(1-self.alpha)*100:.0f}% synthetic)")
         else:
             print("AugmentedReplayBuffer: no synthetic data — pure real")
 
@@ -219,7 +262,6 @@ class AugmentedReplayBuffer:
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
 
     def sample(self, batch_size: int) -> Dict[str, Tensor]:
-        """Sample a mixed minibatch for Q/V/actor training."""
         if self.synthetic is None or self.alpha >= 1.0:
             return self.real.sample(batch_size)
 
@@ -235,10 +277,7 @@ class AugmentedReplayBuffer:
         }
 
     def sample_real(self, batch_size: int) -> Dict[str, Tensor]:
-        """
-        Sample ONLY real transitions — used for BC anchor in agent.py.
-        Always returns real data regardless of alpha.
-        """
+        """Always returns real transitions — used for BC anchor."""
         return self.real.sample(batch_size)
 
     def __len__(self) -> int:

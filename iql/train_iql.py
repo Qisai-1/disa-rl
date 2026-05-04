@@ -81,8 +81,8 @@ def train_iql(args) -> None:
         obs_dim     = obs_dim,
         action_dim  = action_dim,
         hidden_dims = (256, 256),
-        expectile   = 0.7,
-        temperature = 3.0,
+        expectile   = args.expectile,
+        temperature = args.temperature,
         discount    = 0.99,
         tau         = 0.005,
         lr_q        = 3e-4,
@@ -101,8 +101,14 @@ def train_iql(args) -> None:
     if args.mode == "augmented":
         syn_path = args.synthetic_data or get_synthetic_path(args.env)
         if os.path.exists(syn_path):
-            synthetic_buffer = SyntheticBuffer(syn_path, device,
-                                               return_weighting=True)  # ← NEW
+            synthetic_buffer = SyntheticBuffer(
+                syn_path, device,
+                real_reward_mean  = real_buffer.reward_mean,
+                real_reward_std   = real_buffer.reward_std,
+                normalize_rewards = True,
+                filter_sigma      = 3.0,
+                return_weighting  = True,
+            )
             alpha = args.alpha
         else:
             print(f"\nWARNING: Synthetic data not found at {syn_path}")
@@ -137,8 +143,10 @@ def train_iql(args) -> None:
             seed       = args.seed,
             num_steps  = args.num_steps,
             batch_size = args.batch_size,
-            alpha      = alpha,
-            bc_weight  = args.bc_weight,
+            alpha       = alpha,
+            bc_weight   = args.bc_weight,
+            expectile   = args.expectile,
+            temperature = args.temperature,
         ),
     )
 
@@ -213,6 +221,10 @@ if __name__ == "__main__":
                         help="Path to synthetic .npz (auto-detected if None)")
     parser.add_argument("--alpha",      type=float, default=0.5,
                         help="Fraction of real data (0.5=50%% real, 0.0=100%% synthetic)")
+    parser.add_argument("--expectile",   type=float, default=0.7,
+                        help="IQL expectile for value function (0.7=standard, 0.9=optimistic)")
+    parser.add_argument("--temperature", type=float, default=3.0,
+                        help="AWR temperature for actor update (3.0=standard, 10.0=stronger)")
     parser.add_argument("--bc_weight",  type=float, default=0.1,
                         help="BC anchor weight on real data (0.0 = disabled)")
     parser.add_argument("--num_steps",  type=int,   default=1_000_000)

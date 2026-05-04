@@ -13,62 +13,46 @@
 #  CONFIG — edit these values
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Environments to train (space-separated)
-# titan3:        "halfcheetah-medium-v2 hopper-medium-v2"
-# scslab-titan1: "walker2d-medium-v2 ant-medium-v2"
 ENVS="halfcheetah-medium-v2 hopper-medium-v2"
-
-# Alpha values to sweep (space-separated)
-# 0.5  = 50% real + 50% synthetic
-# 0.25 = 25% real + 75% synthetic
-# 0.0  = 100% synthetic (pure diffusion)
 ALPHAS="0.5 0.25 0.0"
-
-# Seeds (space-separated)
 SEEDS="0 1 2 3 4"
-
-# Training mode
 MODE="augmented"
-
-# BC anchor weight (0.0 = disabled, 0.1 = recommended)
 BC_WEIGHT=0.1
-
-# WandB project
 WANDB_PROJECT="disa-rl-medium"
-
-# Max parallel seeds per env per alpha (tune for your GPU VRAM)
-# 4090 24GB: 10 is safe  (5 per env × 2 envs)
-# TitanX 12GB: 4 is safe (2 per env × 2 envs)
 MAX_PARALLEL=10
-
-# Total training steps
 NUM_STEPS=1000000
-
-# GPU index (usually 0, beast0 has 0 and 1)
 GPU=0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCRIPT — no need to edit below this line
 # ══════════════════════════════════════════════════════════════════════════════
 
-cd "$(dirname "$0")/.."   # always run from repo root
-mkdir -p logs
+cd "$(dirname "$0")/.."
+mkdir -p logs results
 
-echo "=========================================="
-echo "  DiSA-RL Local IQL Training"
-echo "  $(date)"
-echo "=========================================="
-echo "  Envs    : $ENVS"
-echo "  Alphas  : $ALPHAS"
-echo "  Seeds   : $SEEDS"
-echo "  Mode    : $MODE"
-echo "  BC wt   : $BC_WEIGHT"
-echo "  Project : $WANDB_PROJECT"
-echo "  GPU     : $GPU"
-echo "=========================================="
+# Timestamped results file
+RESULTS_FILE="results/iql_results_$(date +%Y%m%d_%H%M%S).txt"
+RESULTS_CSV="results/iql_results_$(date +%Y%m%d_%H%M%S).csv"
+
+log_and_print() {
+    echo "$1"
+    echo "$1" >> "$RESULTS_FILE"
+}
+
+echo "=========================================="  | tee "$RESULTS_FILE"
+echo "  DiSA-RL Local IQL Training"               | tee -a "$RESULTS_FILE"
+echo "  $(date)"                                   | tee -a "$RESULTS_FILE"
+echo "=========================================="  | tee -a "$RESULTS_FILE"
+echo "  Envs    : $ENVS"                           | tee -a "$RESULTS_FILE"
+echo "  Alphas  : $ALPHAS"                         | tee -a "$RESULTS_FILE"
+echo "  Seeds   : $SEEDS"                          | tee -a "$RESULTS_FILE"
+echo "  Mode    : $MODE"                           | tee -a "$RESULTS_FILE"
+echo "  BC wt   : $BC_WEIGHT"                      | tee -a "$RESULTS_FILE"
+echo "  GPU     : $GPU"                            | tee -a "$RESULTS_FILE"
+echo "==========================================" | tee -a "$RESULTS_FILE"
 echo ""
 
-# Verify synthetic data exists for augmented mode
+# Verify synthetic data
 if [[ "$MODE" == "augmented" ]]; then
     echo "Checking synthetic data..."
     for env in $ENVS; do
@@ -84,18 +68,23 @@ if [[ "$MODE" == "augmented" ]]; then
     echo ""
 fi
 
-# Run alpha sweep — one alpha at a time, all envs×seeds in parallel
+# Training loop
 for alpha in $ALPHAS; do
-    echo "------------------------------------------"
-    echo "  Alpha = $alpha  ($(date))"
-    echo "------------------------------------------"
+    echo "------------------------------------------" | tee -a "$RESULTS_FILE"
+    echo "  Alpha = $alpha  ($(date))"               | tee -a "$RESULTS_FILE"
+    echo "------------------------------------------" | tee -a "$RESULTS_FILE"
 
-    n_running=0
+    pids=()
     for env in $ENVS; do
         for seed in $SEEDS; do
-            # Wait if we've hit the parallel limit
-            while [[ $(jobs -r | wc -l) -ge $MAX_PARALLEL ]]; do
-                sleep 5
+            # Wait if we have hit the parallel limit
+            while [[ ${#pids[@]} -ge $MAX_PARALLEL ]]; do
+                new_pids=()
+                for pid in "${pids[@]}"; do
+                    kill -0 "$pid" 2>/dev/null && new_pids+=("$pid")
+                done
+                pids=("${new_pids[@]}")
+                [[ ${#pids[@]} -ge $MAX_PARALLEL ]] && sleep 10
             done
 
             log="logs/iql_${env}_${MODE}_alpha${alpha}_s${seed}.log"
@@ -108,30 +97,88 @@ for alpha in $ALPHAS; do
                 --bc_weight      "$BC_WEIGHT" \
                 --seed           "$seed" \
                 --num_steps      "$NUM_STEPS" \
+                --expectile      "$EXPECTILE" \
+                --temperature    "$TEMPERATURE" \
                 --wandb_project  "$WANDB_PROJECT" \
                 >> "$log" 2>&1 &
+            pids+=($!)
         done
     done
 
-    # Wait for all jobs at this alpha to finish
-    wait
-    echo "  Done alpha=$alpha  ($(date))"
+    # Wait for all jobs at this alpha before moving to next
+    echo "  Waiting for ${#pids[@]} jobs to finish..."
+    for pid in "${pids[@]}"; do
+        wait "$pid"
+    done
+    echo "  Done alpha=$alpha  ($(date))" | tee -a "$RESULTS_FILE"
     echo ""
 done
 
-echo "=========================================="
-echo "  All done: $(date)"
-echo "=========================================="
+echo "==========================================" | tee -a "$RESULTS_FILE"
+echo "  All training done: $(date)"               | tee -a "$RESULTS_FILE"
+echo "==========================================" | tee -a "$RESULTS_FILE"
 
-# Quick summary of final scores
+# ── Results summary ────────────────────────────────────────────────────────
+{
 echo ""
-echo "Final scores:"
+echo "=========================================="
+echo "  RESULTS SUMMARY"
+echo "=========================================="
+printf "  %-35s %7s %10s %10s\n" "Env" "Alpha" "Best" "Final"
+printf "  %s\n" "------------------------------------------------------------"
+} | tee -a "$RESULTS_FILE"
+
+# CSV header
+echo "env,alpha,seeds,best_mean,best_std,final_mean,final_std" > "$RESULTS_CSV"
+
 for env in $ENVS; do
     for alpha in $ALPHAS; do
+        best_scores=()
+        final_scores=()
+
         for seed in $SEEDS; do
             log="logs/iql_${env}_${MODE}_alpha${alpha}_s${seed}.log"
-            score=$(grep "normalized=" "$log" 2>/dev/null | tail -1 | grep -oP "normalized=\K[0-9.]+")
-            [[ -n "$score" ]] && echo "  $env alpha=$alpha seed=$seed → $score"
+            [[ ! -f "$log" ]] && continue
+
+            best=$(grep -oP "normalized=\K[0-9.]+" "$log" 2>/dev/null | \
+                   sort -n | tail -1)
+            final=$(grep -oP "normalized=\K[0-9.]+" "$log" 2>/dev/null | \
+                    tail -1)
+
+            [[ -n "$best"  ]] && best_scores+=("$best")
+            [[ -n "$final" ]] && final_scores+=("$final")
         done
+
+        if [[ ${#best_scores[@]} -gt 0 ]]; then
+            result=$(python3 -c "
+import numpy as np
+best  = [${best_scores[@]}]
+final = [${final_scores[@]}]
+bm, bs = np.mean(best), np.std(best)
+fm, fs = np.mean(final), np.std(final)
+print(f'DISPLAY {bm:.1f}±{bs:.1f} {fm:.1f}±{fs:.1f}')
+print(f'CSV {len(best)},{bm:.3f},{bs:.3f},{fm:.3f},{fs:.3f}')
+" 2>/dev/null)
+            display=$(echo "$result" | grep "^DISPLAY" | sed 's/DISPLAY //')
+            csv_vals=$(echo "$result" | grep "^CSV" | sed 's/CSV //')
+            best_mean=$(echo "$display" | awk '{print $1}')
+            final_mean=$(echo "$display" | awk '{print $2}')
+
+            printf "  %-35s %7s %10s %10s\n" "$env" "$alpha" "$best_mean" "$final_mean" \
+                | tee -a "$RESULTS_FILE"
+            echo "$env,$alpha,$csv_vals" >> "$RESULTS_CSV"
+        else
+            printf "  %-35s %7s %10s %10s\n" "$env" "$alpha" "---" "---" \
+                | tee -a "$RESULTS_FILE"
+        fi
     done
 done
+
+{
+echo "=========================================="
+echo ""
+echo "Saved to:"
+echo "  Text : $RESULTS_FILE"
+echo "  CSV  : $RESULTS_CSV"
+echo "=========================================="
+} | tee -a "$RESULTS_FILE"
