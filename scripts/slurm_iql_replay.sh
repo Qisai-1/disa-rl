@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:h200:2
 #SBATCH --cpus-per-task=4
-#SBATCH --ntasks=4
-#SBATCH --mem=120G
+#SBATCH --ntasks=2
+#SBATCH --mem=64G
 #SBATCH --job-name="disa_iql_replay"
 #SBATCH --account=mech-ai
 #SBATCH --mail-user=supersai@iastate.edu
@@ -30,44 +30,48 @@ mkdir -p logs/slurm
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /work/mech-ai-scratch/supersai/.conda/envs/disa
 
+# ── Configuration ─────────────────────────────────────────────────────────────
+ALPHAS=("0.5" )
+SEEDS=( 2 3 4)
+BC_WEIGHT=0.1
+
 ENVS=(
     "halfcheetah-medium-replay-v2"
     "hopper-medium-replay-v2"
     "walker2d-medium-replay-v2"
     "ant-medium-replay-v2"
 )
-SEEDS=(0 1 2 3 4)
-ALPHAS=("1.0:offline_only" "0.75:augmented" "0.5:augmented" "0.0:augmented")
 
+# ── Launch — 4 GPUs, one env per GPU ─────────────────────────────────────────
 for i in "${!ENVS[@]}"; do
     ENV="${ENVS[$i]}"
     GPU=$i
     SYN="./data/synthetic/$ENV/synthetic_transitions.npz"
 
     (
-        for ALPHA_MODE in "${ALPHAS[@]}"; do
-            ALPHA="${ALPHA_MODE%%:*}"
-            MODE="${ALPHA_MODE##*:}"
+        if [[ ! -f "$SYN" ]]; then
+            echo "GPU $GPU [$ENV] ERROR: No synthetic data at $SYN — skipping"
+            exit 0
+        fi
 
-            if [[ "$MODE" == "augmented" ]] && [[ ! -f "$SYN" ]]; then
-                echo "GPU $GPU [$ENV] WARNING: No synthetic data — skipping alpha=$ALPHA"
-                continue
-            fi
-
-            echo "GPU $GPU [$ENV] mode=$MODE alpha=$ALPHA seeds=0-4  ($(date))"
+        for ALPHA in "${ALPHAS[@]}"; do
+            echo "GPU $GPU [$ENV] alpha=$ALPHA bc=$BC_WEIGHT seeds=0-4  ($(date))"
 
             for seed in "${SEEDS[@]}"; do
                 CUDA_VISIBLE_DEVICES=$GPU python iql/train_iql.py \
                     --env           "$ENV" \
-                    --mode          "$MODE" \
+                    --mode          augmented \
                     --alpha         "$ALPHA" \
+                    --bc_weight     "$BC_WEIGHT" \
                     --seed          "$seed" \
                     --num_steps     1000000 \
-                    --wandb_project disa-rl \
-                    >> "logs/slurm/iql_${ENV}_${MODE}_alpha${ALPHA}_s${seed}_${SLURM_JOB_ID}.log" 2>&1 &
+                    --expectile     0.7 \
+                    --temperature   3.0 \
+                    --wandb_project disa-rl-replay \
+                    >> "logs/slurm/iql_${ENV}_alpha${ALPHA}_s${seed}_${SLURM_JOB_ID}.log" 2>&1 &
             done
             wait
-            echo "GPU $GPU [$ENV] Done: mode=$MODE alpha=$ALPHA  ($(date))"
+            echo "GPU $GPU [$ENV] Done: alpha=$ALPHA  ($(date))"
         done
     ) &
 done

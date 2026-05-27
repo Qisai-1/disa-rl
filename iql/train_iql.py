@@ -59,8 +59,9 @@ def get_env_info(env_name: str, data_dir: str = "./data"):
     act_dim = data["actions"].shape[1]
     return obs_dim, act_dim, data_path
 
-def get_synthetic_path(env_name: str) -> str:
-    return f"./data/synthetic/{env_name}/synthetic_transitions.npz"
+def get_synthetic_path(env_name: str, vcdg: bool = False) -> str:
+    fname = "synthetic_transitions_vcdg.npz" if vcdg else "synthetic_transitions.npz"
+    return f"./data/synthetic/{env_name}/{fname}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -77,29 +78,42 @@ def train_iql(args) -> None:
     # ── Agent ─────────────────────────────────────────────────────────────
     # bc_weight: BC anchor on real data only, keeps policy from chasing
     # unreachable synthetic states. Disabled for offline_only mode.
+    q_h = tuple(args.q_hidden_dims) if args.q_hidden_dims else None
     agent = IQLAgent(
         obs_dim     = obs_dim,
         action_dim  = action_dim,
         hidden_dims = (256, 256),
+        q_hidden_dims = q_h,
+        v_hidden_dims = q_h,
         expectile   = args.expectile,
+        expectile_real = args.expectile_real,
+        expectile_syn  = args.expectile_syn,
         temperature = args.temperature,
         discount    = 0.99,
         tau         = 0.005,
         lr_q        = 3e-4,
         lr_v        = 3e-4,
         lr_pi       = 3e-4,
-        bc_weight   = args.bc_weight,   # ← NEW: BC anchor weight
+        bc_weight   = args.bc_weight,
+        adv_normalize = args.adv_normalize,
+        num_critics  = args.num_critics,
+        critic_subset_size = args.critic_subset,
+        sa_iql       = args.sa_iql,
+        sa_clip      = tuple(args.sa_clip),
+        action_noise_std = args.action_noise_std,
+        pa_weight    = args.pa_weight,
+        pa_min_q     = args.pa_min_q,
         device      = device,
     )
 
     # ── Buffers ───────────────────────────────────────────────────────────
-    real_buffer = ReplayBuffer(data_path, device)
+    real_buffer = ReplayBuffer(data_path, device, reward_scale=args.reward_scale)
 
     synthetic_buffer = None
     alpha = 1.0  # default: pure real
 
     if args.mode == "augmented":
-        syn_path = args.synthetic_data or get_synthetic_path(args.env)
+        syn_path = args.synthetic_data or get_synthetic_path(args.env, vcdg=args.use_vcdg_data)
         if os.path.exists(syn_path):
             synthetic_buffer = SyntheticBuffer(
                 syn_path, device,
@@ -108,6 +122,7 @@ def train_iql(args) -> None:
                 normalize_rewards = True,
                 filter_sigma      = 3.0,
                 return_weighting  = True,
+                reward_scale      = args.reward_scale,
             )
             alpha = args.alpha
         else:
@@ -121,6 +136,8 @@ def train_iql(args) -> None:
         real_buffer      = real_buffer,
         synthetic_buffer = synthetic_buffer,
         alpha            = alpha,
+        alpha_warmup     = args.alpha_warmup,
+        alpha_ramp       = args.alpha_ramp,
     )
 
     # ── Evaluator ─────────────────────────────────────────────────────────
@@ -159,11 +176,38 @@ def train_iql(args) -> None:
     print(f"  Output    : {output_dir}/")
     print(f"{'='*55}\n")
 
+    # ── Resume from checkpoint ─────────────────────────────────────────────
+    start_step = 1
+    if args.resume:
+        import glob
+        ckpts = glob.glob(os.path.join(output_dir, "step_*.pt"))
+        if ckpts:
+            # Pick the most recently written checkpoint, not the highest step
+            # number — stale checkpoints from an earlier run with a different
+            # architecture may share this dir and have larger step numbers.
+            latest = max(ckpts, key=os.path.getmtime)
+            agent.load(latest)
+            start_step = agent.total_steps + 1
+            if start_step > args.num_steps:
+                raise SystemExit(
+                    f"  Resume checkpoint {os.path.basename(latest)} is at step "
+                    f"{agent.total_steps:,} >= --num_steps {args.num_steps:,}. "
+                    f"Refusing to no-op — check for stale checkpoints in {output_dir}.")
+            # Keep the alpha warmup/ramp schedule aligned with the global step.
+            aug_buffer._step = agent.total_steps
+            print(f"  Resuming from {os.path.basename(latest)} "
+                  f"→ continuing at step {start_step:,}/{args.num_steps:,}")
+        else:
+            print(f"  --resume set but no step_*.pt in {output_dir} — "
+                  f"starting fresh from step 1.")
+
     # ── Training loop ──────────────────────────────────────────────────────
     best_score = -float("inf")
-    pbar = tqdm(total=args.num_steps, desc=f"IQL [{args.mode}] seed={args.seed}")
+    pbar = tqdm(total=args.num_steps, initial=start_step - 1,
+                desc=f"IQL [{args.mode}] seed={args.seed}")
 
-    for step in range(1, args.num_steps + 1):
+    for step in range(start_step, args.num_steps + 1):
+        aug_buffer.step()                       # advances alpha warmup/ramp
         batch = aug_buffer.sample(args.batch_size)
 
         # BC anchor: pass real_batch so actor stays close to real distribution.
@@ -233,7 +277,58 @@ if __name__ == "__main__":
     parser.add_argument("--log_every",  type=int,   default=1_000)
     parser.add_argument("--save_every", type=int,   default=100_000)
     parser.add_argument("--seed",       type=int,   default=0)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from the latest step_*.pt checkpoint in the "
+                             "run's output dir (restores optimizer + step state).")
     parser.add_argument("--wandb_project", type=str, default="disa-rl",
                         help="WandB project name")
+    parser.add_argument("--use_vcdg_data", action="store_true",
+                        help="Use synthetic_transitions_vcdg.npz (VCDG-generated)")
+    parser.add_argument("--q_hidden_dims", type=int, nargs="*", default=None,
+                        help="Q/V hidden dims, e.g. --q_hidden_dims 256 256 256 256")
+    parser.add_argument("--adv_normalize", action="store_true", default=True,
+                        help="Normalize AWR advantages (default ON)")
+    parser.add_argument("--no_adv_normalize", dest="adv_normalize",
+                        action="store_false", help="Disable advantage normalization")
+
+    # ── SA-IQL (A1) ──────────────────────────────────────────────────────
+    parser.add_argument("--sa_iql", action="store_true",
+                        help="Enable SA-IQL: mixture expectile + density-ratio TD weighting")
+    parser.add_argument("--expectile_real", type=float, default=None,
+                        help="SA-IQL expectile on real transitions (default: --expectile)")
+    parser.add_argument("--expectile_syn",  type=float, default=None,
+                        help="SA-IQL expectile on syn transitions (default: --expectile)")
+    parser.add_argument("--sa_clip", type=float, nargs=2, default=[0.5, 2.0],
+                        help="SA-IQL density-ratio clip range")
+
+    # ── Q-ensemble ───────────────────────────────────────────────────────
+    parser.add_argument("--num_critics", type=int, default=2,
+                        help="Number of Q-networks. 2 = Twin-Q, >=3 = QEnsemble (REDQ-style)")
+    parser.add_argument("--critic_subset", type=int, default=2,
+                        help="Random subset size for min target (REDQ trick)")
+
+    # ── Action-noise augmentation ─────────────────────────────────────────
+    parser.add_argument("--action_noise_std", type=float, default=0.0,
+                        help="Gaussian noise std added to dataset actions in AWR log_prob")
+
+    # ── Alpha warmup (fixes augmented-slower-than-baseline) ──────────────
+    parser.add_argument("--alpha_warmup", type=int, default=0,
+                        help="Number of pure-real (alpha=1.0) steps before any syn mixing. "
+                             "Default 0 (immediate mixing). 50000 = standard warmup.")
+    parser.add_argument("--alpha_ramp", type=int, default=0,
+                        help="Steps to linearly ramp alpha from 1.0 down to --alpha. "
+                             "Default 0 (instant). 50000 = smooth schedule.")
+
+    # ── PARS-style reward scaling + PA loss (ICML 2025) ────────────────
+    parser.add_argument("--reward_scale", type=float, default=1.0,
+                        help="Multiply rewards by this factor (PARS). "
+                             "Recommended: halfcheetah 5; hopper/walker2d 10; ant 5-10.")
+    parser.add_argument("--pa_weight", type=float, default=0.0,
+                        help="Weight of PARS Penalty-for-Infeasible-Actions loss term. "
+                             "Typical: 0.0001 (MuJoCo) — 0.01 (sparse).")
+    parser.add_argument("--pa_min_q", type=float, default=0.0,
+                        help="Q lower bound used as target for PA loss "
+                             "(target Q on OOD actions).")
+
     args = parser.parse_args()
     train_iql(args)

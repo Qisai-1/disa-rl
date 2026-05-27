@@ -48,6 +48,12 @@ DATASETS = {
     # Ant
     "ant-medium-v2":                "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2/ant_medium-v2.hdf5",
     "ant-medium-replay-v2":         "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2/ant_medium_replay-v2.hdf5",
+
+    # ── medium-expert (added 2026-05-26 for 12-env main table) ──
+    "halfcheetah-medium-expert-v2": "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2/halfcheetah_medium_expert-v2.hdf5",
+    "hopper-medium-expert-v2":      "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2/hopper_medium_expert-v2.hdf5",
+    "walker2d-medium-expert-v2":    "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2/walker2d_medium_expert-v2.hdf5",
+    "ant-medium-expert-v2":         "https://rail.eecs.berkeley.edu/datasets/offline_rl/gym_mujoco_v2/ant_medium_expert-v2.hdf5",
 }
 
 # Observation/action dims for each environment

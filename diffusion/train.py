@@ -175,9 +175,16 @@ def validate(
 def train_offline(
     cfg:          Config,
     resume_from:  Optional[str] = None,
+    qcd_iql_ckpt: Optional[str] = None,
+    qcd_use_v:    bool          = False,
 ) -> str:
     """
     Phase 0: Offline pre-training on D4RL dataset.
+
+    QCD (Pillar 2): when qcd_iql_ckpt is set, the diffusion model is
+    conditioned on Q_φ(s_0, a_0) from the pretrained IQL critic instead
+    of the sub-trajectory return. The model architecture is unchanged —
+    only the conditioning scalar changes.
 
     Returns path to the final checkpoint (which includes the EWC Fisher).
     """
@@ -197,6 +204,9 @@ def train_offline(
         action_dim        = cfg.model.action_dim,
         use_return_cond   = cfg.model.use_return_cond,
         seed              = cfg.seed,
+        qcd_iql_ckpt      = qcd_iql_ckpt,
+        qcd_use_v         = qcd_use_v,
+        qcd_device        = device,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.training.batch_size,
@@ -533,6 +543,24 @@ if __name__ == "__main__":
         "--min_delta", type=float, default=None,
         help="Early stopping min improvement (overrides config default of 1e-4).",
     )
+    parser.add_argument("--hidden_size", type=int, default=256,
+                        help="Hidden dim. 256 (~5M params) is the recommended size.")
+    parser.add_argument("--depth",       type=int, default=6,
+                        help="Number of transformer blocks.")
+    parser.add_argument("--num_heads",   type=int, default=4)
+    parser.add_argument("--mlp_dropout", type=float, default=0.3,
+                        help="MLP dropout for regularization (0.3 default).")
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    # ── QCD (Pillar 2): Q-conditional diffusion training ────────────────
+    parser.add_argument("--qcd", action="store_true",
+                        help="Enable Q-Conditional Diffusion. Replaces "
+                             "return-conditioning with Q_φ(s_0, a_0) from a "
+                             "pretrained IQL critic. See diffusion/q_conditional.py.")
+    parser.add_argument("--qcd_iql_ckpt", type=str, default=None,
+                        help="Path to IQL critic checkpoint. "
+                             "Default: checkpoints/<env>/iql/offline_only/seed_0/final.pt")
+    parser.add_argument("--qcd_use_v", action="store_true",
+                        help="Use V(s_0) instead of Q(s_0, a_0) for conditioning.")
     args = parser.parse_args()
 
     if args.env not in ENV_REGISTRY:
@@ -548,12 +576,12 @@ if __name__ == "__main__":
             obs_dim           = obs_dim,
             action_dim        = action_dim,
             trajectory_length = 100,
-            hidden_size       = 512,
-            depth             = 8,
-            num_heads         = 8,
+            hidden_size       = args.hidden_size,
+            depth             = args.depth,
+            num_heads         = args.num_heads,
             cfg_dropout_prob  = 0.10,
             use_return_cond   = True,
-            mlp_dropout       = 0.1,
+            mlp_dropout       = args.mlp_dropout,
         ),
         loss = LossConfig(
             lambda_obs      = 1.0,
@@ -566,7 +594,7 @@ if __name__ == "__main__":
             patience     = args.patience  if args.patience  is not None else 10,
             min_delta    = args.min_delta if args.min_delta is not None else 1e-4,
             lr           = args.lr if args.lr is not None else 1e-4,
-            weight_decay = 1e-4,
+            weight_decay = args.weight_decay,
             num_steps    = args.num_steps,
             grad_clip    = 1.0,
             ema_decay    = 0.9999,

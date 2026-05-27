@@ -111,29 +111,36 @@ class TrajectoryGenerator:
     def _build_cond(
         self,
         initial_states: np.ndarray,   # (B, obs_dim) unnormalised
-        target_return:  float,
+        target_scalar:  float,        # return OR Q-target depending on cond_kind
     ) -> torch.Tensor:
-        norm_s0  = self.normalizer.obs.normalize(initial_states).astype(np.float32)
-        norm_ret = np.full(
-            (len(initial_states), 1),
-            self.normalizer.normalize_return(target_return),
-            dtype=np.float32,
+        """
+        Build the condition vector. The scalar is normalised by whichever
+        statistics the normalizer was fit with — return_mean/std for the
+        standard return-conditioned model, q_mean/std for QCD.
+        """
+        norm_s0     = self.normalizer.obs.normalize(initial_states).astype(np.float32)
+        # Dispatch based on what the normalizer was fit with
+        norm_scalar_value = self.normalizer.normalize_scalar(target_scalar)
+        norm_scalar = np.full(
+            (len(initial_states), 1), norm_scalar_value, dtype=np.float32,
         )
-        cond = np.concatenate([norm_s0, norm_ret], axis=1)
+        cond = np.concatenate([norm_s0, norm_scalar], axis=1)
         return torch.from_numpy(cond).to(self.device)
 
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
     def generate(
         self,
         n_trajectories: int                        = 64,
         initial_states: Optional[np.ndarray]       = None,
         target_return:  float                      = 3000.0,
+        target_q:       Optional[float]            = None,   # QCD inference
         gen_cfg:        Optional[GenerationConfig] = None,
         force_env:      Optional[str]              = None,
+        value_fn=None,
+        vcdg_guidance_scale: float = 0.5,
     ) -> Dict:
         """
         Generate a batch of denormalised trajectories.
@@ -170,15 +177,52 @@ class TrajectoryGenerator:
             reps           = int(np.ceil(n_trajectories / len(initial_states)))
             initial_states = np.tile(initial_states, (reps, 1))[:n_trajectories]
 
-        cond = self._build_cond(initial_states, target_return)  # (B, cond_dim)
+        # Dispatch the conditioning scalar based on the normalizer's cond_kind
+        cond_kind = getattr(self.normalizer, "cond_kind", "return")
+        if cond_kind == "q":
+            if target_q is None:
+                raise ValueError(
+                    "Diffusion checkpoint was trained with Q-conditioning (QCD), "
+                    "but target_q was not provided. Pass `target_q=` to .generate()."
+                )
+            cond_scalar = target_q
+        else:
+            cond_scalar = target_return
+        cond = self._build_cond(initial_states, cond_scalar)  # (B, cond_dim)
 
-        # Generate in normalised space
-        trajs_norm = self.cfm.heun_sample(
-            batch_size = n_trajectories,
-            cond       = cond,
-            nfe        = gen_cfg.nfe,
-            cfg_scale  = gen_cfg.cfg_scale,
-        ).cpu().numpy()   # (B, T, D)
+        # Generate in normalised space — either plain Heun or value-guided
+        if value_fn is not None:
+            # Wrap value_fn to denormalize obs before evaluating V_phi.
+            # value_fn operates on REAL observations; the diffusion state
+            # is in NORMALIZED space, so we project back through the
+            # normalizer's affine map. This keeps gradient flow intact
+            # (the affine map is differentiable).
+            from diffusion.value_guided import value_guided_heun
+            obs_mean = torch.from_numpy(self.normalizer.obs.mean.astype('float32')).to(self.device)
+            obs_std  = torch.from_numpy(
+                (self.normalizer.obs.std + 1e-8).astype('float32')
+            ).to(self.device)
+
+            def _vf_normspace(obs_norm):
+                obs_real = obs_norm * obs_std + obs_mean
+                return value_fn(obs_real)
+
+            trajs_norm = value_guided_heun(
+                cfm = self.cfm, batch_size = n_trajectories, cond = cond,
+                value_fn = _vf_normspace, obs_dim = obs_dim,
+                obs_denorm = lambda x: x,    # unused
+                nfe = gen_cfg.nfe, cfg_scale = gen_cfg.cfg_scale,
+                guidance_scale = vcdg_guidance_scale,
+                guidance_schedule = "linear-decay",
+            ).cpu().numpy()
+        else:
+            with torch.no_grad():
+                trajs_norm = self.cfm.heun_sample(
+                    batch_size = n_trajectories,
+                    cond       = cond,
+                    nfe        = gen_cfg.nfe,
+                    cfg_scale  = gen_cfg.cfg_scale,
+                ).cpu().numpy()   # (B, T, D)
 
         # Clip extreme values in normalised space before denormalising
         # (prevents NaN/inf from propagating through denormalisation)

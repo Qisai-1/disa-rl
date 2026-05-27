@@ -140,6 +140,61 @@ class TwinQNetwork(nn.Module):
         q1, q2 = self.forward(obs, action)
         return torch.min(q1, q2)
 
+    def all(self, obs: Tensor, action: Tensor) -> Tensor:
+        """Stack of [q1, q2] of shape (M=2, B). Compatible with QEnsemble API."""
+        q1, q2 = self.forward(obs, action)
+        return torch.stack([q1, q2], dim=0)
+
+
+class QEnsemble(nn.Module):
+    """
+    Ensemble of M Q-networks (REDQ-style).
+
+    - forward(obs, action) -> (M, B) all Q values
+    - min(obs, action)     -> (B,)   min over a random subset of size `subset`
+                              (REDQ trick: subset < M reduces optimism less
+                              than min over all, and matches the spirit of
+                              clipped double Q.)
+    - all(obs, action)     -> same as forward, kept for API parity
+
+    Pessimism: at *target* computation we take min over random subset.
+    At Q-update time we still update each critic on its own TD target.
+
+    Reference: REDQ (Chen et al. 2021, ICLR), CCEM, but adapted for offline
+    IQL (where we use min(Q) as the V target rather than as a policy target).
+    """
+
+    def __init__(
+        self,
+        obs_dim:     int,
+        action_dim:  int,
+        hidden_dims: Tuple[int, ...] = (256, 256),
+        num_critics: int = 10,
+        subset_size: int = 2,
+    ):
+        super().__init__()
+        self.num_critics = num_critics
+        self.subset_size = subset_size
+        self.qs = nn.ModuleList([
+            QNetwork(obs_dim, action_dim, hidden_dims)
+            for _ in range(num_critics)
+        ])
+
+    def forward(self, obs: Tensor, action: Tensor) -> Tensor:
+        """Returns (M, B) — all Q values."""
+        return torch.stack([q(obs, action) for q in self.qs], dim=0)
+
+    def all(self, obs: Tensor, action: Tensor) -> Tensor:
+        return self.forward(obs, action)
+
+    def min(self, obs: Tensor, action: Tensor) -> Tensor:
+        """min over random subset of size `subset_size` (REDQ-style)."""
+        all_q = self.forward(obs, action)                       # (M, B)
+        if self.subset_size >= self.num_critics:
+            return all_q.min(dim=0).values
+        idx = torch.randperm(self.num_critics, device=obs.device)[:self.subset_size]
+        return all_q[idx].min(dim=0).values
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Actor  π(a | s)

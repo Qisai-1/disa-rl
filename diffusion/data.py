@@ -47,6 +47,10 @@ class DataNormalizer:
     """
     Per-modality z-score normalizer for (obs, action, reward) trajectories.
     Also tracks cumulative return statistics for the CFG condition vector.
+
+    QCD (Pillar 2) extension: optionally tracks q_mean / q_std for
+    Q-conditional diffusion. When q stats are set, callers should use
+    `normalize_q` instead of `normalize_return` for the condition scalar.
     """
 
     def __init__(
@@ -56,12 +60,18 @@ class DataNormalizer:
         reward:      ChannelStats,
         return_mean: float = 0.0,
         return_std:  float = 1.0,
+        q_mean:      float = 0.0,
+        q_std:       float = 1.0,
+        cond_kind:   str   = "return",     # "return" or "q"
     ):
         self.obs    = obs
         self.action = action
         self.reward = reward
         self.return_mean = float(return_mean)
         self.return_std  = float(return_std)
+        self.q_mean      = float(q_mean)
+        self.q_std       = float(q_std)
+        self.cond_kind   = cond_kind
 
     # ------------------------------------------------------------------
     # Factory
@@ -110,6 +120,16 @@ class DataNormalizer:
     def denormalize_return(self, r: float) -> float:
         return r * (self.return_std + 1e-8) + self.return_mean
 
+    def normalize_q(self, q: float) -> float:
+        return (q - self.q_mean) / (self.q_std + 1e-8)
+
+    def denormalize_q(self, q: float) -> float:
+        return q * (self.q_std + 1e-8) + self.q_mean
+
+    def normalize_scalar(self, x: float) -> float:
+        """Dispatch to return or Q normalization based on cond_kind."""
+        return self.normalize_q(x) if self.cond_kind == "q" else self.normalize_return(x)
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -121,16 +141,26 @@ class DataNormalizer:
             reward_mean = self.reward.mean, reward_std = self.reward.std,
             return_mean = np.array([self.return_mean]),
             return_std  = np.array([self.return_std]),
+            q_mean      = np.array([self.q_mean]),
+            q_std       = np.array([self.q_std]),
+            cond_kind   = np.array([self.cond_kind]),
         )
 
     @classmethod
     def from_dict(cls, d: Dict) -> "DataNormalizer":
+        # Backwards-compat: older checkpoints have no q_* / cond_kind keys
+        q_mean    = float(np.array(d["q_mean"]).flatten()[0])    if "q_mean"   in d else 0.0
+        q_std     = float(np.array(d["q_std"]).flatten()[0])     if "q_std"    in d else 1.0
+        cond_kind = str(np.array(d["cond_kind"]).flatten()[0])   if "cond_kind" in d else "return"
         return cls(
             obs    = ChannelStats(np.array(d["obs_mean"]),    np.array(d["obs_std"])),
             action = ChannelStats(np.array(d["action_mean"]), np.array(d["action_std"])),
             reward = ChannelStats(np.array(d["reward_mean"]), np.array(d["reward_std"])),
             return_mean = float(np.array(d["return_mean"]).flatten()[0]),
             return_std  = float(np.array(d["return_std"]).flatten()[0]),
+            q_mean      = q_mean,
+            q_std       = q_std,
+            cond_kind   = cond_kind,
         )
 
     def save(self, path: str) -> None:
@@ -267,37 +297,59 @@ class TrajectoryDataset(Dataset):
     Dataset of normalised fixed-length trajectory sub-sequences.
 
     Each sample is a dict:
-        'trajectory' : (T, D)        normalised (obs, action, reward)
-        'condition'  : (cond_dim,)   [norm_s0 | norm_return]
+        'trajectory' : (T, D)        normalised (obs, action)
+        'condition'  : (cond_dim,)   [norm_s0 | norm_scalar]
+
+    The conditioning scalar is either:
+      - the **return** of the sub-trajectory (standard, what Decision Diffuser
+        / SynthER / GTA do), or
+      - a **Q-target** Q_φ(s_0, a_0) from a pretrained offline IQL critic
+        (our QCD novelty — Pillar 2).
+
+    Which scalar is used is governed by `normalizer.cond_kind`:
+      "return" → use `returns`        (the original behavior)
+      "q"      → use `q_targets`      (QCD)
     """
 
     def __init__(
         self,
-        trajs:           np.ndarray,    # (N, T, D_full) raw unnormalised, D_full includes reward
-        returns:         np.ndarray,    # (N,)
+        trajs:           np.ndarray,         # (N, T, D_full) — D_full includes reward
+        returns:         np.ndarray,         # (N,) — sub-traj returns
         normalizer:      DataNormalizer,
         obs_dim:         int  = 17,
         action_dim:      int  = 6,
         use_return_cond: bool = True,
+        q_targets:       Optional[np.ndarray] = None,   # (N,) — required if cond_kind=="q"
     ):
         self.obs_dim         = obs_dim
         self.action_dim      = action_dim
         self.normalizer      = normalizer
         self.use_return_cond = use_return_cond
+        self.cond_kind       = getattr(normalizer, "cond_kind", "return")
 
         # Keep only (obs, action) — drop reward column before normalising
         trajs_oa = trajs[..., :obs_dim + action_dim]
-
-        # Normalise all trajectories up front (keeps __getitem__ cheap)
         self.trajs = normalizer.normalize_batch(trajs_oa, obs_dim, action_dim)
 
-        # Normalised returns for conditioning
-        self.norm_returns = (
-            (returns - normalizer.return_mean) / (normalizer.return_std + 1e-8)
-        ).astype(np.float32)
+        # Normalised conditioning scalar — return-based or Q-based
+        if self.cond_kind == "q":
+            if q_targets is None:
+                raise ValueError(
+                    "cond_kind='q' but q_targets=None. Pass q_targets to TrajectoryDataset."
+                )
+            self.norm_scalars = (
+                (q_targets - normalizer.q_mean) / (normalizer.q_std + 1e-8)
+            ).astype(np.float32)
+            self.raw_scalars  = q_targets.astype(np.float32)
+        else:
+            self.norm_scalars = (
+                (returns - normalizer.return_mean) / (normalizer.return_std + 1e-8)
+            ).astype(np.float32)
+            self.raw_scalars  = returns.astype(np.float32)
 
-        # Keep raw returns for reward-quality reporting
-        self.raw_returns = returns.astype(np.float32)
+        # Legacy aliases (other code reads these)
+        self.norm_returns = self.norm_scalars
+        self.raw_returns  = self.raw_scalars
 
     def __len__(self) -> int:
         return len(self.trajs)
@@ -307,8 +359,8 @@ class TrajectoryDataset(Dataset):
         s0   = traj[0, :self.obs_dim]                     # (obs_dim,)
 
         if self.use_return_cond:
-            ret  = torch.tensor([self.norm_returns[idx]])
-            cond = torch.cat([s0, ret], dim=0)            # (obs_dim + 1,)
+            scalar = torch.tensor([self.norm_scalars[idx]])
+            cond   = torch.cat([s0, scalar], dim=0)       # (obs_dim + 1,)
         else:
             cond = s0
 
@@ -329,6 +381,9 @@ def build_datasets(
     action_dim:        int           = 6,
     use_return_cond:   bool          = True,
     seed:              int           = 42,
+    qcd_iql_ckpt:      Optional[str] = None,        # QCD: path to IQL critic
+    qcd_use_v:         bool          = False,       # True → V(s_0); False → Q(s_0, a_0)
+    qcd_device:        Optional["torch.device"] = None,
 ) -> Tuple[TrajectoryDataset, TrajectoryDataset, DataNormalizer]:
     """
     Full pipeline: load → split episodes → sliding window → normalize → split.
@@ -357,18 +412,44 @@ def build_datasets(
     # 2. Fit normalizer on full dataset (before train/val split)
     normalizer = DataNormalizer.from_trajectories(all_trajs, obs_dim, action_dim)
 
+    # 2b. QCD (Pillar 2): compute Q-targets for each sub-trajectory if a
+    # critic was provided. Q-targets become the conditioning scalar
+    # in place of returns. The model arch is unchanged.
+    all_q_targets = None
+    if qcd_iql_ckpt is not None:
+        import torch
+        from diffusion.q_conditional import compute_q_targets_from_critic
+        device = qcd_device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        s0 = all_trajs[:, 0, :obs_dim]
+        a0 = all_trajs[:, 0, obs_dim:obs_dim + action_dim]
+        all_q_targets = compute_q_targets_from_critic(
+            iql_ckpt=qcd_iql_ckpt, obs=s0, actions=a0,
+            device=device, use_v=qcd_use_v,
+        )
+        # Stash Q stats in the normalizer so generation can denormalize.
+        normalizer.q_mean    = float(all_q_targets.mean())
+        normalizer.q_std     = float(all_q_targets.std() + 1e-8)
+        normalizer.cond_kind = "q"
+        print(f"  QCD: cond_kind set to 'q'  "
+              f"(Q stats: mean={normalizer.q_mean:.3f}  std={normalizer.q_std:.3f})")
+
     # 3. Train / val split
     n      = len(all_trajs)
     n_val  = max(1, int(n * val_fraction))
     perm   = rng.permutation(n)
     val_i, train_i = perm[:n_val], perm[n_val:]
 
+    q_train = all_q_targets[train_i] if all_q_targets is not None else None
+    q_val   = all_q_targets[val_i]   if all_q_targets is not None else None
     train_ds = TrajectoryDataset(all_trajs[train_i], all_returns[train_i],
-                                 normalizer, obs_dim, action_dim, use_return_cond)
+                                 normalizer, obs_dim, action_dim, use_return_cond,
+                                 q_targets=q_train)
     val_ds   = TrajectoryDataset(all_trajs[val_i],   all_returns[val_i],
-                                 normalizer, obs_dim, action_dim, use_return_cond)
+                                 normalizer, obs_dim, action_dim, use_return_cond,
+                                 q_targets=q_val)
 
-    print(f"Train: {len(train_ds):,}   Val: {len(val_ds):,}")
+    print(f"Train: {len(train_ds):,}   Val: {len(val_ds):,}  "
+          f"cond_kind={normalizer.cond_kind}")
     return train_ds, val_ds, normalizer
 
 

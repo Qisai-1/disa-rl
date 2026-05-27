@@ -19,3 +19,6 @@ Thumbs.db
 tea_debug.log
 *.tmp
 *.bak
+.claude/
+a.out
+*.hdf5

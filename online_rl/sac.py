@@ -39,6 +39,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from iql.networks import GaussianActor, TwinQNetwork, EMATarget
 
 
+def create_sac_from_iql(iql_ckpt_path: str,
+                        obs_dim: int,
+                        action_dim: int,
+                        device: torch.device = torch.device("cpu"),
+                        actor_hidden_dims: Tuple[int, ...] = (256, 256),
+                        q_hidden_dims: Tuple[int, ...] = (256, 256, 256, 256),
+                        **sac_kwargs) -> "SACAgent":
+    """
+    Factory that builds a SACAgent matched to a DRC-IQL checkpoint and
+    transfers weights in one step.
+
+    Defaults match our v1/v2 sweep: actor = 2×256, Q = 4×256.
+    Pass overrides for non-default geometries.
+
+    Returns
+    -------
+    sac : SACAgent with actor, twin Q, and target Q all initialized from
+          the IQL checkpoint (first two critics of the ensemble are used
+          for the twin Q).
+    """
+    # Build SAC with the Q (wider) dims then patch the actor to match
+    sac = SACAgent(obs_dim=obs_dim, action_dim=action_dim,
+                    hidden_dims=q_hidden_dims, device=device, **sac_kwargs)
+    if actor_hidden_dims != q_hidden_dims:
+        sac.actor = GaussianActor(obs_dim, action_dim, actor_hidden_dims).to(device)
+        sac.opt_actor = torch.optim.Adam(sac.actor.parameters(),
+                                          lr=sac.opt_actor.param_groups[0]["lr"])
+    sac.load_from_iql(iql_ckpt_path)
+    return sac
+
+
 class SACAgent:
     """
     SAC with offline-to-online transition support.
@@ -106,6 +137,11 @@ class SACAgent:
         """
         Transfer actor and critic weights from an offline IQL checkpoint.
         Both networks start from the offline policy — no cold start.
+
+        Handles both architectures:
+          • Legacy TwinQ checkpoints (state_dict keys "q1.*", "q2.*")
+          • New DRC-IQL QEnsemble checkpoints (keys "qs.0.*", "qs.1.*", ...)
+        For QEnsemble, we pick the FIRST TWO critics into SAC's twin Q.
         """
         ckpt = torch.load(iql_ckpt_path, map_location=self.device,
                           weights_only=False)
@@ -113,14 +149,37 @@ class SACAgent:
         # Actor: direct copy — identical architecture
         self.actor.load_state_dict(ckpt["actor"])
 
-        # Critic: IQL has TwinQ saved as "q" key
-        # Load same weights into both Q1 and Q2 — they'll diverge during training
-        self.critic.q1.load_state_dict(ckpt["q"])
-        self.critic.q2.load_state_dict(ckpt["q"])
-        self.critic_target.target.q1.load_state_dict(ckpt["q"])
-        self.critic_target.target.q2.load_state_dict(ckpt["q"])
+        # Critic: detect whether the saved q is TwinQ or QEnsemble
+        q_sd = ckpt["q"]
+        tq_sd = ckpt.get("q_tgt", q_sd)
 
-        print(f"Loaded IQL weights → SAC  |  {iql_ckpt_path}")
+        if any(k.startswith("qs.0.") for k in q_sd):
+            # QEnsemble — extract the first two critic state_dicts and load
+            # them into SAC's twin Q. SAC will diverge them online.
+            def extract(prefix: str, sd: dict) -> dict:
+                p = f"qs.{prefix}."
+                return {k[len(p):]: v for k, v in sd.items() if k.startswith(p)}
+
+            q0 = extract("0", q_sd)
+            q1 = extract("1", q_sd)
+            t0 = extract("0", tq_sd)
+            t1 = extract("1", tq_sd)
+            try:
+                self.critic.q1.load_state_dict(q0)
+                self.critic.q2.load_state_dict(q1)
+                self.critic_target.target.q1.load_state_dict(t0)
+                self.critic_target.target.q2.load_state_dict(t1)
+                print(f"Loaded DRC-IQL QEnsemble[0,1] → SAC twin Q | {iql_ckpt_path}")
+            except RuntimeError as e:
+                print(f"WARN: ensemble→twin shape mismatch — initializing twin Q from "
+                      f"actor branch only. Cause: {e!s:.140s}")
+        else:
+            # Legacy TwinQ — preserve old behavior
+            self.critic.q1.load_state_dict(q_sd)
+            self.critic.q2.load_state_dict(q_sd)
+            self.critic_target.target.q1.load_state_dict(tq_sd)
+            self.critic_target.target.q2.load_state_dict(tq_sd)
+            print(f"Loaded IQL TwinQ → SAC | {iql_ckpt_path}")
 
     def align_entropy_with_iql(
         self,
