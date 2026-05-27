@@ -47,19 +47,23 @@ def value_guided_heun(
     cfm            : ConditionalFlowMatching object (provides _velocity)
     batch_size     : number of trajectories
     cond           : (B, cond_dim) conditioning tensor
-    value_fn       : callable V(s)->scalar, takes (B*T, obs_dim) in
-                     UNNORMALIZED space. We compute gradient w.r.t. obs
-                     and project back to NORMALIZED space using the
-                     normalizer that produced obs.
+    value_fn       : callable V(x_obs) → (B*T,). Should ACCEPT the obs
+                     vector in whatever space the caller chose to expose
+                     (typically a closure that internally denormalises
+                     before calling the IQL V_phi — see generate.py:_vf_normspace).
+                     The gradient flows back through value_fn into x_g.
     obs_dim        : observation dimension
-    obs_denorm     : numpy callable that denormalises observations
-                     (just used for shape/dtype consistency — gradient
-                     pulling happens through autograd on the unnormalised
-                     state assembled via the normalizer's affine transform)
+    obs_denorm     : DEPRECATED — ignored; kept only for caller backward-
+                     compat. value_fn is responsible for the obs-space
+                     transform.
     guidance_scale : λ_v in the formula above
-    guidance_schedule : "constant" or "linear-decay" — `linear-decay`
-                       multiplies guidance by (1 - t), strongest near the
-                       clean end of the diffusion (t≈1).
+    guidance_schedule : "constant" or "linear-ramp" (alias: "linear-decay"
+                       — kept for backward compat). Both ramp UP with t:
+                       λ(t) = guidance_scale * t. At t→0 (pure noise) the
+                       value gradient is meaningless, so λ≈0; at t→1
+                       (near-clean data) λ≈guidance_scale so guidance
+                       actually steers the trajectory. Fixed 2026-05-26
+                       from a previous (1-t) version that did the opposite.
     """
     device = cfm.device
     T = cfm.model.T
@@ -83,8 +87,14 @@ def value_guided_heun(
             v_uncond = cfm._velocity(x, t_curr, cond, cfg_scale)
 
         # ── 2. Value-function gradient w.r.t. the OBS portion of x ──────
-        if guidance_schedule == "linear-decay":
-            lam = guidance_scale * (1.0 - t_curr_scalar)
+        # Ramp guidance UP with t. At t≈0 the diffusion state is pure
+        # noise → V's gradient is meaningless → λ≈0 (no guidance).
+        # At t≈1 the state is near-clean data → V's gradient is meaningful
+        # → λ≈guidance_scale (full guidance). Bugfix 2026-05-26: the
+        # previous formulation (1 - t_curr) inverted this and effectively
+        # applied guidance only on noise, which was useless.
+        if guidance_schedule in ("linear-ramp", "linear-decay"):
+            lam = guidance_scale * t_curr_scalar
         else:
             lam = guidance_scale
 
