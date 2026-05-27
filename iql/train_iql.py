@@ -35,6 +35,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iql.agent import IQLAgent
+from iql.agent_capa import CAPAAgent
 from iql.buffer import ReplayBuffer, SyntheticBuffer, AugmentedReplayBuffer
 from iql.evaluator import make_evaluator
 
@@ -79,7 +80,17 @@ def train_iql(args) -> None:
     # bc_weight: BC anchor on real data only, keeps policy from chasing
     # unreachable synthetic states. Disabled for offline_only mode.
     q_h = tuple(args.q_hidden_dims) if args.q_hidden_dims else None
-    agent = IQLAgent(
+    # CAPA constraints: requires augmented mode + must not combine with --sa_iql.
+    if args.capa:
+        if args.mode != "augmented":
+            raise SystemExit("ERROR: --capa requires --mode augmented (CAPA only "
+                             "makes sense when synthetic data is mixed in).")
+        if args.sa_iql:
+            raise SystemExit("ERROR: --capa is incompatible with --sa_iql. "
+                             "CAPA replaces DRC's defensive mechanisms.")
+
+    AgentClass = CAPAAgent if args.capa else IQLAgent
+    agent_kwargs = dict(
         obs_dim     = obs_dim,
         action_dim  = action_dim,
         hidden_dims = (256, 256),
@@ -105,6 +116,9 @@ def train_iql(args) -> None:
         pa_min_q     = args.pa_min_q,
         device      = device,
     )
+    if args.capa:
+        agent_kwargs["unc_beta"] = args.unc_beta
+    agent = AgentClass(**agent_kwargs)
 
     # ── Buffers ───────────────────────────────────────────────────────────
     real_buffer = ReplayBuffer(data_path, device, reward_scale=args.reward_scale)
@@ -145,8 +159,11 @@ def train_iql(args) -> None:
 
     # ── WandB ─────────────────────────────────────────────────────────────
     env_tag  = args.env.replace("-v2", "").replace("-", "_")
-    run_name = f"iql_{env_tag}_{args.mode}_alpha{args.alpha}_s{args.seed}"
-    output_dir = os.path.join("./checkpoints", args.env, "iql", args.mode,
+    # CAPA runs go to a separate output dir so they don't collide with
+    # vanilla augmented (DRC) runs at the same alpha.
+    mode_dir = "capa" if args.capa else args.mode
+    run_name = f"iql_{env_tag}_{mode_dir}_alpha{args.alpha}_s{args.seed}"
+    output_dir = os.path.join("./checkpoints", args.env, "iql", mode_dir,
                                f"alpha{args.alpha}", f"seed_{args.seed}")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -211,11 +228,13 @@ def train_iql(args) -> None:
         batch = aug_buffer.sample(args.batch_size)
 
         # BC anchor: pass real_batch so actor stays close to real distribution.
-        # Only used in augmented mode with bc_weight > 0.
-        # In offline_only mode real_batch=None → standard AWR only.
-        real_batch = aug_buffer.sample_real(args.batch_size) \
-                     if args.mode == "augmented" and args.bc_weight > 0 \
-                     else None
+        # Used by IQLAgent when bc_weight > 0; CAPA *always* needs real_batch
+        # (for the real-only V/Q updates, regardless of bc_weight).
+        need_real_batch = (
+            (args.mode == "augmented" and args.bc_weight > 0)
+            or args.capa
+        )
+        real_batch = aug_buffer.sample_real(args.batch_size) if need_real_batch else None
 
         metrics = agent.update(batch, real_batch=real_batch)  # ← NEW
 
@@ -300,6 +319,16 @@ if __name__ == "__main__":
                         help="SA-IQL expectile on syn transitions (default: --expectile)")
     parser.add_argument("--sa_clip", type=float, nargs=2, default=[0.5, 2.0],
                         help="SA-IQL density-ratio clip range")
+
+    # ── CAPA (Critic-Anchored Proposal Augmentation, headline method) ────
+    parser.add_argument("--capa", action="store_true",
+                        help="Enable CAPA: real-only critic + syn-actor + "
+                             "ensemble-uncertainty gate. Requires --mode augmented. "
+                             "Incompatible with --sa_iql. See METHOD_V2_PROPOSAL.md.")
+    parser.add_argument("--unc_beta", type=float, default=1.0,
+                        help="CAPA uncertainty-gate strength on syn AWR rows: "
+                             "gate(syn) = exp(-unc_beta * q_ensemble_std). "
+                             "1.0 = standard. 0.0 = disable gate (ablation).")
 
     # ── Q-ensemble ───────────────────────────────────────────────────────
     parser.add_argument("--num_critics", type=int, default=2,
