@@ -93,6 +93,37 @@ def get_env_info_for_generation(env_name, data_dir="./data", ckpt_dir="./checkpo
     return obs_dim, act_dim, ckpt_path, target_return, sub_returns
 
 
+def compute_terminals(env_base: str, next_obs: np.ndarray) -> np.ndarray:
+    """Analytic MuJoCo termination on an (N, obs_dim) array of next-states.
+
+    Mirrors the gym-v2 `done` condition exactly — termination is a known
+    closed-form function of the state for locomotion (just like the reward).
+    A `done=1` flag means next_obs is a genuine terminal state (the agent
+    fell), which correctly CUTS the value bootstrap. Window boundaries are
+    handled separately as TRUNCATIONS (their transition is dropped, not
+    flagged terminal). halfcheetah never terminates; unknown envs → all 0.
+
+    Obs layout: obs[0]=height (qpos[1] for hopper/walker, qpos[2]=torso-z for
+    ant), obs[1]=torso angle (hopper/walker).
+    """
+    finite = np.isfinite(next_obs).all(axis=1)
+    if env_base == "hopper":
+        z, ang = next_obs[:, 0], next_obs[:, 1]
+        bounded = (np.abs(next_obs[:, 1:]) < 100).all(axis=1)
+        healthy = finite & bounded & (z > 0.7) & (np.abs(ang) < 0.2)
+        return (~healthy).astype(np.float32)
+    if env_base == "walker2d":
+        z, ang = next_obs[:, 0], next_obs[:, 1]
+        healthy = finite & (z > 0.8) & (z < 2.0) & (ang > -1.0) & (ang < 1.0)
+        return (~healthy).astype(np.float32)
+    if env_base == "ant":
+        z = next_obs[:, 0]
+        healthy = finite & (z >= 0.2) & (z <= 1.0)
+        return (~healthy).astype(np.float32)
+    # halfcheetah (never terminates) and any unknown env
+    return np.zeros(len(next_obs), dtype=np.float32)
+
+
 def _load_iql_critic(env: str, obs_dim: int, action_dim: int, device,
                      iql_ckpt: Optional[str] = None):
     """Return (q_fn, v_fn, agent) where q_fn(s,a) and v_fn(s) are callables
@@ -239,7 +270,7 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
         real_obs_for_init = _real["observations"].astype(np.float32)
         print(f"Sampling initial states from real data ({len(real_obs_for_init):,} states)")
 
-    all_obs, all_actions, all_next_obs, all_dones = [], [], [], []
+    all_obs, all_actions, all_next_obs = [], [], []
 
     for i in tqdm(range(n_batches), desc=f"Generating {env}"):
         # Sample real initial states for CFG conditioning
@@ -278,19 +309,19 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
         actions_b = result["actions"]               # (B, T, action_dim)
 
         B, T, _ = obs_b.shape
+        # Emit transitions for t = 0 .. T-2 only. The final step (t=T-1) has no
+        # real successor inside the window — its boundary is a TRUNCATION (the
+        # behavior continues beyond the window), not a termination, so we drop
+        # that degenerate self-loop entirely rather than fake a terminal there.
         for b in range(B):
-            for t in range(T):
-                done     = (t == T - 1)
-                next_obs = obs_b[b, t] if done else obs_b[b, t + 1]
+            for t in range(T - 1):
                 all_obs.append(obs_b[b, t])
                 all_actions.append(actions_b[b, t])
-                all_next_obs.append(next_obs)
-                all_dones.append(float(done))
+                all_next_obs.append(obs_b[b, t + 1])
 
     obs      = np.stack(all_obs)[:n_transitions].astype(np.float32)
     actions  = np.stack(all_actions)[:n_transitions].astype(np.float32)
     next_obs = np.stack(all_next_obs)[:n_transitions].astype(np.float32)
-    dones    = np.array(all_dones, dtype=np.float32)[:n_transitions]
 
     # Velocity-integration: enforce per-transition physics by overwriting the
     # next-state POSITIONS with s'_pos = s_pos + dt·s_vel (the generated next-state
@@ -311,6 +342,14 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
             next_obs[:, :npos] = obs[:, :npos] + dtp * obs[:, voff:voff+npos]
             print(f"  integrate_velocity ON ({base}): next_obs[:{npos}] ← "
                   f"obs_pos + {dtp}·obs_vel  (pre-fix mean |Δpos−dt·v|={before:.4f} → 0)")
+
+    # Analytic termination: done=1 iff next_obs is a genuine terminal state
+    # (computed on the FINAL next_obs, after velocity-integration). Window
+    # boundaries were already dropped above as truncations.
+    env_base = env.split("-")[0]
+    dones = compute_terminals(env_base, next_obs)
+    print(f"  terminals: {int(dones.sum()):,}/{len(dones):,} "
+          f"({100*dones.mean():.2f}%) analytic done=1 ({env_base})")
 
     # Compute rewards — either analytically (default) or via TD relabel (VCDG)
     if use_vcdg and vcdg_td_relabel:
