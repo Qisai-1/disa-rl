@@ -111,16 +111,19 @@ class ConditionalFlowMatching:
         # Kinematic-consistency — Δpos ≈ dt·velocity WITHIN the predicted clean
         # trajectory, in raw obs space (denormalize so dt·vel has the right
         # scale incl. velocity mean; divide by per-dim real |Δpos| → dimensionless).
-        # Weighted by tau²: at high noise (tau→0) x1_pred is unreliable, so only
-        # enforce physics where the clean-trajectory estimate is trustworthy.
+        # UNIFORM weighting over tau: an earlier tau²-weighting concentrated the
+        # constraint at low noise (tau→1) where x1_pred≈real and the constraint is
+        # trivially satisfied — so the model drove loss/dyn→0.05 while samples
+        # stayed 22× jittery. Uniform weighting makes the (large) high-noise
+        # residuals dominate, shaping the velocity field that actually sets
+        # sampled-trajectory structure. (grad_clip=1.0 contains the magnitude.)
         if getattr(lc, "lambda_dyn", 0.0) > 0.0 and self.kin is not None:
             npos = self.kin["n_pos"]; voff = self.kin["vel_offset"]; dtp = self.kin["dt"]
             obs_pred = x1_pred[..., :obs_dim] * self._obs_std + self._obs_mean   # (B,T,obs_dim) raw
             dpos = obs_pred[:, 1:, :npos] - obs_pred[:, :-1, :npos]              # (B,T-1,npos)
             vel  = obs_pred[:, :-1, voff:voff + npos]
             resid = (dpos - dtp * vel) / self._kin_scale                         # dimensionless
-            w = (tau ** 2)[:, None, None]                                        # (B,1,1)
-            L_dyn = (w * resid.pow(2)).mean()
+            L_dyn = resid.pow(2).mean()
             total = total + lc.lambda_dyn * L_dyn
             metrics["loss/dyn"] = L_dyn.item()
 
