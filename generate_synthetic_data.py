@@ -137,7 +137,8 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
                              vcdg_guidance_scale=0.5,
                              vcdg_td_relabel=True,
                              vcdg_q_anomaly=True,
-                             use_idm=False, idm_ckpt=None):
+                             use_idm=False, idm_ckpt=None,
+                             integrate_velocity=False):
     """
     Parameters
     ----------
@@ -291,6 +292,26 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
     next_obs = np.stack(all_next_obs)[:n_transitions].astype(np.float32)
     dones    = np.array(all_dones, dtype=np.float32)[:n_transitions]
 
+    # Velocity-integration: enforce per-transition physics by overwriting the
+    # next-state POSITIONS with s'_pos = s_pos + dt·s_vel (the generated next-state
+    # velocities are kept). Makes Δpos = dt·vel exactly, so the (s,s') the critic
+    # bootstraps on is a physical successor of s. Fixes the temporal-jitter defect
+    # (see project-diffusion-dynamics-defect) without retraining. Only for envs
+    # whose Euler kinematics hold (hopper/walker2d; not halfcheetah at dt=0.05).
+    if integrate_velocity:
+        # env_base -> (n_pos, vel_offset, dt)
+        _KIN = {"hopper": (5, 6, 0.008), "walker2d": (8, 9, 0.008)}
+        base = env.split("-")[0]
+        if base not in _KIN:
+            print(f"  integrate_velocity: '{base}' has no kinematic layout — SKIPPED")
+        else:
+            npos, voff, dtp = _KIN[base]
+            before = float(np.abs((next_obs[:, :npos] - obs[:, :npos])
+                                  - dtp * obs[:, voff:voff+npos]).mean())
+            next_obs[:, :npos] = obs[:, :npos] + dtp * obs[:, voff:voff+npos]
+            print(f"  integrate_velocity ON ({base}): next_obs[:{npos}] ← "
+                  f"obs_pos + {dtp}·obs_vel  (pre-fix mean |Δpos−dt·v|={before:.4f} → 0)")
+
     # Compute rewards — either analytically (default) or via TD relabel (VCDG)
     if use_vcdg and vcdg_td_relabel:
         print("VCDG: relabelling rewards via r = V(s) - gamma * V(s')")
@@ -404,6 +425,10 @@ if __name__ == "__main__":
                         help="Disable TD reward relabeling under VCDG")
     parser.add_argument("--no_vcdg_q_anomaly", action="store_true",
                         help="Disable Q-anomaly filter under VCDG")
+    parser.add_argument("--integrate_velocity", action="store_true",
+                        help="Enforce per-transition physics: next_obs positions "
+                             "← obs_pos + dt·obs_vel (hopper/walker2d). Fixes the "
+                             "temporal-jitter defect at generation time.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -417,4 +442,5 @@ if __name__ == "__main__":
         vcdg_guidance_scale=args.vcdg_guidance_scale,
         vcdg_td_relabel=not args.no_vcdg_td_relabel,
         vcdg_q_anomaly=not args.no_vcdg_q_anomaly,
+        integrate_velocity=args.integrate_velocity,
     )
