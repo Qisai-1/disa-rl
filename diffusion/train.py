@@ -244,6 +244,25 @@ def train_offline(
     ema = EMA(model, decay=cfg.training.ema_decay)
     cfm = ConditionalFlowMatching(model, device, loss_cfg=cfg.loss)
 
+    # Kinematic-consistency loss — enable iff lambda_dyn>0 and the env layout is
+    # known (hopper/walker/halfcheetah). Targets the temporal-jitter defect.
+    if getattr(cfg.loss, "lambda_dyn", 0.0) > 0.0:
+        kin = kinematics_for(cfg.data.dataset_name)
+        if kin is None:
+            print(f"  WARN: --dyn_weight set but '{cfg.data.dataset_name}' not in "
+                  "KINEMATICS — kinematic loss DISABLED for this env.")
+        else:
+            n_pos, vel_off, dt_phys = kin
+            scale = compute_kin_scale(cfg.data.data_path, n_pos)
+            cfm.set_kinematics(
+                obs_mean=normalizer.obs.mean, obs_std=normalizer.obs.std,
+                n_pos=n_pos, vel_offset=vel_off, dt=dt_phys, scale=scale,
+                device=device,
+            )
+            print(f"  Kinematic loss ON: λ_dyn={cfg.loss.lambda_dyn}  "
+                  f"n_pos={n_pos} vel_off={vel_off} dt={dt_phys}  "
+                  f"scale={np.round(scale,4)}")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr           = cfg.training.lr,
@@ -503,6 +522,39 @@ ENV_REGISTRY = {
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Kinematic layout for the dynamics-consistency loss.
+#   obs = [qpos[exclude_global], qvel, ...].  pos[i] pairs with obs[vel_offset+i]
+#   and Δpos ≈ dt·vel holds for the real data.  Ant is omitted: its qpos has a
+#   quaternion (orientation) whose derivative is NOT dt·angular-velocity, plus
+#   84 contact-force dims — needs special handling, not the simple Euler rule.
+#   dict: env_base -> (n_pos, vel_offset, dt)
+# ──────────────────────────────────────────────────────────────────────────────
+KINEMATICS = {
+    "hopper":      (5, 6, 0.008),   # 5 qpos[1:] + 6 qvel,  frame_skip 4 × 0.002
+    "walker2d":    (8, 9, 0.008),   # 8 qpos[1:] + 9 qvel,  frame_skip 4 × 0.002
+    "halfcheetah": (8, 9, 0.05),    # 8 qpos[1:] + 9 qvel,  frame_skip 5 × 0.01
+}
+
+
+def kinematics_for(env_name: str):
+    """Return (n_pos, vel_offset, dt) or None if the env isn't supported."""
+    base = env_name.split("-")[0]
+    return KINEMATICS.get(base)
+
+
+def compute_kin_scale(data_path: str, n_pos: int) -> "np.ndarray":
+    """Per-pos-dim mean |Δpos| on the real data (episode-respecting). Used to
+    make the kinematic residual dimensionless so lambda_dyn is env-agnostic."""
+    d = np.load(data_path, allow_pickle=True)
+    obs  = d["observations"].astype(np.float64)
+    term = d.get("terminals", np.zeros(len(obs), bool)).astype(bool)
+    tout = d.get("timeouts",  np.zeros(len(obs), bool)).astype(bool)
+    valid = ~(term | tout)[:-1]
+    dpos = obs[1:][valid][:, :n_pos] - obs[:-1][valid][:, :n_pos]
+    return np.abs(dpos).mean(0) + 1e-8
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -561,6 +613,16 @@ if __name__ == "__main__":
                              "Default: checkpoints/<env>/iql/offline_only/seed_0/final.pt")
     parser.add_argument("--qcd_use_v", action="store_true",
                         help="Use V(s_0) instead of Q(s_0, a_0) for conditioning.")
+    parser.add_argument("--dyn_weight", type=float, default=0.0,
+                        help="Kinematic-consistency loss weight (lambda_dyn). "
+                             "Penalizes ||Δpos − dt·vel|| within generated "
+                             "trajectories. 0=off. Only active for envs "
+                             "in KINEMATICS (hopper/walker/halfcheetah).")
+    parser.add_argument("--output_subdir", type=str, default="diffusion",
+                        help="Subdir under checkpoints/<env>/ to write to. Use a "
+                             "non-default (e.g. 'diffusion_kin') for experiments "
+                             "so production 'diffusion/' checkpoints are never "
+                             "overwritten.")
     args = parser.parse_args()
 
     if args.env not in ENV_REGISTRY:
@@ -587,6 +649,7 @@ if __name__ == "__main__":
             lambda_obs      = 1.0,
             lambda_action   = 1.0,
             lambda_temporal = 0.1,
+            lambda_dyn      = args.dyn_weight,
             lambda_ewc      = 500.0,
         ),
         training = TrainingConfig(
@@ -617,15 +680,15 @@ if __name__ == "__main__":
         wandb_entity  = args.wandb_entity,
         # Each env gets a unique run name on WandB
         exp_name      = f"{env_tag}_bs{args.batch_size}",
-        # Each env gets its own checkpoint folder
-        output_dir    = f"./checkpoints/{args.env}/diffusion",
+        # Each env gets its own checkpoint folder (overridable to protect prod)
+        output_dir    = f"./checkpoints/{args.env}/{args.output_subdir}",
     )
 
     print(f"\n{'='*55}")
     print(f"  Environment : {args.env}")
     print(f"  obs_dim     : {obs_dim}   action_dim: {action_dim}")
     print(f"  batch_size  : {args.batch_size}")
-    print(f"  output_dir  : ./checkpoints/{args.env}/diffusion/")
+    print(f"  output_dir  : ./checkpoints/{args.env}/{args.output_subdir}/")
     print(f"  WandB run   : {cfg.exp_name}")
     print(f"{'='*55}\n")
 

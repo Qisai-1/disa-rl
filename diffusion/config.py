@@ -53,6 +53,14 @@ class LossConfig:
     # Supervises first-order obs differences: ||Δobs_pred - Δobs_real||²
     lambda_temporal: float = 0.1
 
+    # Kinematic-consistency auxiliary loss (physics self-consistency).
+    # Penalizes ||Δpos − dt·velocity||² WITHIN the predicted clean trajectory,
+    # in raw obs space, scaled per-dim. Targets the temporal-jitter defect that
+    # marginal/temporal losses miss (see project-diffusion-dynamics-defect).
+    # 0.0 = off (backward-compatible default). Requires kinematics to be set on
+    # the ConditionalFlowMatching via set_kinematics().
+    lambda_dyn: float = 0.0
+
     # EWC regularisation (only active during online fine-tuning)
     lambda_ewc: float = 500.0    # scale relative to flow matching loss magnitude
 

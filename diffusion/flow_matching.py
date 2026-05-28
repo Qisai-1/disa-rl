@@ -37,6 +37,30 @@ class ConditionalFlowMatching:
         self.device    = device
         self.loss_cfg  = loss_cfg or LossConfig()
         self.cfg_scale = cfg_scale
+        # Kinematic-consistency loss state (set via set_kinematics; off by default)
+        self.kin = None          # dict(n_pos, vel_offset, dt) or None
+        self._obs_mean = None     # (obs_dim,) tensor, raw-space denorm
+        self._obs_std  = None
+        self._kin_scale = None    # (n_pos,) tensor, per-dim real |Δpos| scale
+
+    def set_kinematics(self, obs_mean, obs_std, n_pos: int, vel_offset: int,
+                       dt: float, scale, device=None):
+        """Enable the kinematic-consistency loss.
+
+        obs_mean/obs_std : (obs_dim,) normalizer stats (denormalize x1_pred).
+        n_pos            : number of leading obs dims that are positions.
+        vel_offset       : index where the matching velocities start; pos[i]
+                           pairs with obs[vel_offset + i].
+        dt               : env physics timestep (Δpos ≈ dt·vel).
+        scale            : (n_pos,) per-dim real mean|Δpos| — makes the residual
+                           dimensionless so lambda_dyn is env-agnostic.
+        """
+        dev = device or self.device
+        t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=dev)
+        self._obs_mean = t(obs_mean)
+        self._obs_std  = t(obs_std)
+        self._kin_scale = t(scale)
+        self.kin = dict(n_pos=int(n_pos), vel_offset=int(vel_offset), dt=float(dt))
 
     def get_train_tuple(self, x1: Tensor):
         x0    = torch.randn_like(x1)
@@ -79,11 +103,28 @@ class ConditionalFlowMatching:
                + lc.lambda_temporal * L_temporal)
 
         metrics = {
-            "loss/total":    total.item(),
             "loss/obs":      L_obs.item(),
             "loss/action":   L_action.item(),
             "loss/temporal": L_temporal.item(),
         }
+
+        # Kinematic-consistency — Δpos ≈ dt·velocity WITHIN the predicted clean
+        # trajectory, in raw obs space (denormalize so dt·vel has the right
+        # scale incl. velocity mean; divide by per-dim real |Δpos| → dimensionless).
+        # Weighted by tau²: at high noise (tau→0) x1_pred is unreliable, so only
+        # enforce physics where the clean-trajectory estimate is trustworthy.
+        if getattr(lc, "lambda_dyn", 0.0) > 0.0 and self.kin is not None:
+            npos = self.kin["n_pos"]; voff = self.kin["vel_offset"]; dtp = self.kin["dt"]
+            obs_pred = x1_pred[..., :obs_dim] * self._obs_std + self._obs_mean   # (B,T,obs_dim) raw
+            dpos = obs_pred[:, 1:, :npos] - obs_pred[:, :-1, :npos]              # (B,T-1,npos)
+            vel  = obs_pred[:, :-1, voff:voff + npos]
+            resid = (dpos - dtp * vel) / self._kin_scale                         # dimensionless
+            w = (tau ** 2)[:, None, None]                                        # (B,1,1)
+            L_dyn = (w * resid.pow(2)).mean()
+            total = total + lc.lambda_dyn * L_dyn
+            metrics["loss/dyn"] = L_dyn.item()
+
+        metrics["loss/total"] = total.item()
         return total, metrics
 
     def _velocity(self, x, tau, cond, cfg_scale):
