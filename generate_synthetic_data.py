@@ -160,6 +160,30 @@ def _load_iql_critic(env: str, obs_dim: int, action_dim: int, device,
     return q_fn, v_fn, agent
 
 
+def build_real_subtrajs(env, traj_len, obs_dim, action_dim,
+                        data_dir="./data", stride=10):
+    """Real (obs+action) sub-trajectories + their returns, for GTA-style
+    partial-noising generation. Returns (N, T, obs_dim+action_dim) float32 and
+    (N,) sub-traj returns."""
+    d = np.load(f"{data_dir}/{env}.npz", allow_pickle=True)
+    obs = d["observations"].astype(np.float32)
+    act = d["actions"].astype(np.float32)
+    rew = d["rewards"].astype(np.float32)
+    term = d.get("terminals", np.zeros(len(obs), bool)).astype(bool)
+    tout = d.get("timeouts",  np.zeros(len(obs), bool)).astype(bool)
+    done = term | tout
+    ends = np.where(done)[0] + 1
+    starts = np.concatenate([[0], ends[:-1]])
+    subs, rets = [], []
+    for s, e in zip(starts, ends):
+        for st in range(s, e - traj_len + 1, stride):
+            subs.append(np.concatenate([obs[st:st+traj_len], act[st:st+traj_len]], axis=1))
+            rets.append(float(rew[st:st+traj_len].sum()))
+    if not subs:
+        raise ValueError(f"No sub-trajectories of length {traj_len} in {env}.")
+    return np.asarray(subs, dtype=np.float32), np.asarray(rets, dtype=np.float32)
+
+
 def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
                              nfe=20, cfg_scale=1.5, output_dir="./data/synthetic",
                              device=None, force_env=None,
@@ -169,7 +193,8 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
                              vcdg_td_relabel=True,
                              vcdg_q_anomaly=True,
                              use_idm=False, idm_ckpt=None,
-                             integrate_velocity=False):
+                             integrate_velocity=False,
+                             gta=False, gta_noise_ratio=0.5, gta_return_alpha=1.2):
     """
     Parameters
     ----------
@@ -270,9 +295,44 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
         real_obs_for_init = _real["observations"].astype(np.float32)
         print(f"Sampling initial states from real data ({len(real_obs_for_init):,} states)")
 
+    # GTA-style generation: pre-build real sub-trajectories to partial-noise.
+    if gta:
+        gta_subtrajs, gta_subrets = build_real_subtrajs(env, traj_len, obs_dim, action_dim)
+        nrm = generator.normalizer
+        print(f"  GTA mode: {len(gta_subtrajs):,} real sub-trajs  "
+              f"noise_ratio={gta_noise_ratio}  return_alpha={gta_return_alpha}  "
+              f"(amplified-return + partial-noising)")
+
     all_obs, all_actions, all_next_obs = [], [], []
 
     for i in tqdm(range(n_batches), desc=f"Generating {env}"):
+        # ── GTA path: partial-noise a real sub-traj, denoise w/ amplified return ──
+        if gta:
+            bidx   = np.random.choice(len(gta_subtrajs), size=batch_size, replace=True)
+            x1_raw = gta_subtrajs[bidx]                       # (B, T, obs+act) raw
+            rets   = gta_subrets[bidx]                        # (B,)
+            x1_norm = nrm.normalize_batch(x1_raw, obs_dim, action_dim)  # (B,T,D)
+            x1_t   = torch.from_numpy(x1_norm.astype(np.float32)).to(device)
+            # cond = [normalized s0, normalized AMPLIFIED return]
+            s0       = x1_raw[:, 0, :obs_dim]
+            norm_s0  = nrm.obs.normalize(s0).astype(np.float32)
+            amp_ret  = gta_return_alpha * rets
+            norm_ret = ((amp_ret - nrm.return_mean) / nrm.return_std).astype(np.float32)
+            cond     = torch.from_numpy(
+                np.concatenate([norm_s0, norm_ret[:, None]], axis=1)).to(device)
+            x_gen = generator.cfm.heun_sample_partial(
+                x1_t, cond, noise_ratio=gta_noise_ratio, nfe=nfe, cfg_scale=cfg_scale)
+            gen_oa = nrm.denormalize_batch(
+                x_gen.detach().cpu().numpy(), obs_dim, action_dim)         # (B,T,D)
+            obs_b     = gen_oa[..., :obs_dim]
+            actions_b = np.clip(gen_oa[..., obs_dim:obs_dim + action_dim], -1.0, 1.0)
+            B, T, _ = obs_b.shape
+            for b in range(B):
+                for t in range(T - 1):
+                    all_obs.append(obs_b[b, t]); all_actions.append(actions_b[b, t])
+                    all_next_obs.append(obs_b[b, t + 1])
+            continue
+
         # Sample real initial states for CFG conditioning
         if real_obs_for_init is not None:
             idx = np.random.choice(len(real_obs_for_init), size=batch_size, replace=True)
@@ -468,6 +528,16 @@ if __name__ == "__main__":
                         help="Enforce per-transition physics: next_obs positions "
                              "← obs_pos + dt·obs_vel (hopper/walker2d). Fixes the "
                              "temporal-jitter defect at generation time.")
+    # ── GTA-style generation (arXiv 2405.16907) — the proven high-return win ──
+    parser.add_argument("--gta", action="store_true",
+                        help="GTA-style generation: partial-noise REAL sub-trajs + "
+                             "AMPLIFIED-return guidance (the technique that beats "
+                             "baselines, esp. hopper-mr). Pairs with --integrate_velocity.")
+    parser.add_argument("--gta_noise_ratio", type=float, default=0.5,
+                        help="GTA noise ratio μ∈(0,1]: 0→keep real traj, 1→full gen.")
+    parser.add_argument("--gta_return_alpha", type=float, default=1.2,
+                        help="GTA return amplification α>1: condition on α·return to "
+                             "steer toward higher-return compositions.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -482,4 +552,6 @@ if __name__ == "__main__":
         vcdg_td_relabel=not args.no_vcdg_td_relabel,
         vcdg_q_anomaly=not args.no_vcdg_q_anomaly,
         integrate_velocity=args.integrate_velocity,
+        gta=args.gta, gta_noise_ratio=args.gta_noise_ratio,
+        gta_return_alpha=args.gta_return_alpha,
     )

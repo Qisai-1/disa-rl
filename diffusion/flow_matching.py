@@ -161,6 +161,37 @@ class ConditionalFlowMatching:
         return x
 
     @torch.no_grad()
+    def heun_sample_partial(self, x1, cond, noise_ratio=0.5, nfe=20, cfg_scale=None):
+        """GTA-style partial-noising sampler (arXiv 2405.16907).
+
+        Start from a REAL (normalized) trajectory x1, noise it only partway
+        (to tau0 = 1 - noise_ratio along the flow path), then denoise back to
+        tau=1 under `cond`. With an AMPLIFIED-return cond this refines a real
+        trajectory toward higher return while preserving its structure — which
+        avoids the mode-collapse that conditioning pure-noise generation on
+        out-of-distribution high returns causes.
+        noise_ratio∈(0,1]: 0→keep real traj, 1→full generation (==heun_sample).
+        """
+        w    = cfg_scale if cfg_scale is not None else self.cfg_scale
+        cond = cond.to(self.device)
+        x1   = x1.to(self.device)
+        B    = x1.shape[0]
+        nr   = float(min(max(noise_ratio, 1e-3), 1.0))
+        tau0 = 1.0 - nr
+        x0   = torch.randn_like(x1)
+        x    = tau0 * x1 + (1.0 - tau0) * x0          # partially-noised real traj
+        steps = max(1, int(round(nfe * nr)))
+        dt   = (1.0 - tau0) / steps
+        for i in range(steps):
+            t_curr = torch.full((B,), tau0 + i * dt,             device=self.device)
+            t_next = torch.full((B,), min(tau0 + (i+1)*dt, 1.0), device=self.device)
+            k1     = self._velocity(x,      t_curr, cond, w)
+            x_pred = x + k1 * dt
+            k2     = self._velocity(x_pred, t_next, cond, w)
+            x      = x + (k1 + k2) * 0.5 * dt
+        return x
+
+    @torch.no_grad()
     def euler_sample(self, batch_size, cond, nfe=50, cfg_scale=None):
         w    = cfg_scale if cfg_scale is not None else self.cfg_scale
         cond = cond.to(self.device)
