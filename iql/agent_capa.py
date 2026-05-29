@@ -98,6 +98,7 @@ class CAPAAgent(IQLAgent):
         self,
         batch:      Dict[str, Tensor],            # mixed real+syn (for actor)
         real_batch: Optional[Dict[str, Tensor]] = None,   # real-only (for V/Q + BC)
+        critic_only: bool = False,                # for UTD>1 (RLPD/EDAC-style)
     ) -> Dict[str, float]:
         if real_batch is None:
             raise ValueError(
@@ -215,6 +216,10 @@ class CAPAAgent(IQLAgent):
         metrics["train/q_mean"] = all_q.mean().item()
 
         # ── 3. Actor AWR on MIXED batch, uncertainty-gated for syn rows ───
+        # UTD>1 path: return early on critic-only calls (caller does utd-1 of these
+        # then one full update — more critic gradient with same actor learning).
+        if critic_only:
+            return metrics
         obs    = batch["obs"]
         action = batch["action"]
         # source: 1.0 = real, 0.0 = syn (per ReplayBuffer.sample / SyntheticBuffer.sample)

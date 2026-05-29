@@ -165,9 +165,11 @@ class IQLAgent:
         self,
         batch:      Dict[str, Tensor],
         real_batch: Optional[Dict[str, Tensor]] = None,
+        critic_only: bool = False,
     ) -> Dict[str, float]:
         """
-        One gradient step on all three networks.
+        One gradient step on all three networks (or critic-only if critic_only=True,
+        used for UTD>1 — multiple critic updates per actor update, à la RLPD/EDAC).
 
         Parameters
         ----------
@@ -277,6 +279,10 @@ class IQLAgent:
             metrics["train/w_max"]  = w.max().item()
 
         # ── 3. Actor update (AWR + BC anchor) ─────────────────────────────
+        # UTD>1 path: caller invokes update(critic_only=True) for (utd-1) calls,
+        # then one full update — sharper Q with the ensemble at standard cost.
+        if critic_only:
+            return metrics
         self.opt_pi.zero_grad(set_to_none=True)
         with autocast(enabled=(self.device.type == "cuda")):
 

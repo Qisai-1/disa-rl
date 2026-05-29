@@ -225,20 +225,24 @@ def train_iql(args) -> None:
     pbar = tqdm(total=args.num_steps, initial=start_step - 1,
                 desc=f"IQL [{args.mode}] seed={args.seed}")
 
+    need_real_batch = (
+        (args.mode == "augmented" and args.bc_weight > 0)
+        or args.capa
+    )
+
     for step in range(start_step, args.num_steps + 1):
         aug_buffer.step()                       # advances alpha warmup/ramp
+
+        # UTD>1 (RLPD/EDAC-style): k-1 critic-only updates with FRESH batches +
+        # 1 full update. Sharper Q with the ensemble; ~k× compute.
+        for _ in range(max(args.utd - 1, 0)):
+            b  = aug_buffer.sample(args.batch_size)
+            rb = aug_buffer.sample_real(args.batch_size) if need_real_batch else None
+            agent.update(b, real_batch=rb, critic_only=True)
+
         batch = aug_buffer.sample(args.batch_size)
-
-        # BC anchor: pass real_batch so actor stays close to real distribution.
-        # Used by IQLAgent when bc_weight > 0; CAPA *always* needs real_batch
-        # (for the real-only V/Q updates, regardless of bc_weight).
-        need_real_batch = (
-            (args.mode == "augmented" and args.bc_weight > 0)
-            or args.capa
-        )
         real_batch = aug_buffer.sample_real(args.batch_size) if need_real_batch else None
-
-        metrics = agent.update(batch, real_batch=real_batch)  # ← NEW
+        metrics = agent.update(batch, real_batch=real_batch)
 
         if step % args.log_every == 0:
             metrics["step"] = step
@@ -342,6 +346,11 @@ if __name__ == "__main__":
     # ── Q-ensemble ───────────────────────────────────────────────────────
     parser.add_argument("--num_critics", type=int, default=2,
                         help="Number of Q-networks. 2 = Twin-Q, >=3 = QEnsemble (REDQ-style)")
+    parser.add_argument("--utd", type=int, default=1,
+                        help="Update-To-Data ratio (RLPD/EDAC). >1 = utd-1 extra "
+                             "critic-only updates per actor update. Sharper Q with "
+                             "the ensemble; ~utd× critic compute. Try 4 with LayerNorm "
+                             "+ 10-critic ensemble (we have both).")
     parser.add_argument("--critic_subset", type=int, default=2,
                         help="Random subset size for min target (REDQ trick)")
 
