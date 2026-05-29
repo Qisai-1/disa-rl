@@ -60,9 +60,14 @@ def parse_log(path: str) -> dict:
 
     best = max(scores, key=lambda x: x[1])
     final = scores[-1]
+    # STANDARD metric: mean of the last 10 evaluation rounds (D4RL/CORL
+    # convention) — robust to running-max optimism and per-eval noise.
+    last10 = [s[1] for s in scores[-10:]]
+    last10avg = sum(last10) / len(last10)
     return {
         "tag": tag_part, "env": env, "seed": seed, "alpha": alpha,
         "n_evals": len(scores),
+        "last10avg": last10avg,
         "best":     best[1], "best_step": best[0],
         "final":    final[1], "final_step": final[0],
         "log_path": path,
@@ -95,45 +100,53 @@ def main():
     table_path = os.path.join(args.out_dir, "agg_table.csv")
     with open(table_path, "w") as f:
         w = csv.DictWriter(f, fieldnames=["tag", "env", "alpha", "seed",
-                                           "n_evals", "best", "best_step",
+                                           "n_evals", "last10avg", "best", "best_step",
                                            "final", "final_step", "log_path"])
         w.writeheader()
         for r in rows:
             w.writerow(r)
     print(f"Wrote {len(rows)} rows to {table_path}")
 
-    # Summary: mean ± std over seeds per (tag, env, alpha)
+    # Summary: mean ± std over seeds per (tag, env, alpha).
+    # PRIMARY metric = last10avg (D4RL/CORL standard); best/final kept for reference.
     summary_path = os.path.join(args.out_dir, "agg_summary.csv")
     cells = defaultdict(list)
     for r in rows:
-        cells[(r["tag"], r["env"], r["alpha"])].append((r["best"], r["final"]))
+        cells[(r["tag"], r["env"], r["alpha"])].append(
+            (r["last10avg"], r["best"], r["final"]))
 
     with open(summary_path, "w") as f:
         w = csv.writer(f)
         w.writerow(["tag", "env", "alpha", "n_seeds",
+                    "last10avg_mean", "last10avg_std",
                     "best_mean", "best_std", "final_mean", "final_std"])
         for key, scores in sorted(cells.items()):
-            bests  = [s[0] for s in scores]
-            finals = [s[1] for s in scores]
+            l10s   = [s[0] for s in scores]
+            bests  = [s[1] for s in scores]
+            finals = [s[2] for s in scores]
             n = len(scores)
+            lm, ls = (st.mean(l10s),   st.pstdev(l10s)   if n > 1 else 0.0)
             bm, bs = (st.mean(bests),  st.pstdev(bests)  if n > 1 else 0.0)
             fm, fs = (st.mean(finals), st.pstdev(finals) if n > 1 else 0.0)
             w.writerow([key[0], key[1], f"{key[2]:.2f}", n,
+                        f"{lm:.2f}", f"{ls:.2f}",
                         f"{bm:.2f}", f"{bs:.2f}", f"{fm:.2f}", f"{fs:.2f}"])
     print(f"Wrote summary to {summary_path}")
 
-    # Print summary to stdout for quick inspection
+    # Print summary to stdout — last10avg (PRIMARY) + best/final for reference
     print()
-    print(f"{'tag':<14} {'env':<32} {'alpha':<6} {'n':<3} {'best':<16} {'final':<16}")
-    print("-" * 96)
+    print(f"{'tag':<16} {'env':<30} {'n':<3} {'last10avg (STD metric)':<22} {'best':<14} {'final':<12}")
+    print("-" * 100)
     for key, scores in sorted(cells.items()):
-        bests  = [s[0] for s in scores]
-        finals = [s[1] for s in scores]
+        l10s   = [s[0] for s in scores]
+        bests  = [s[1] for s in scores]
+        finals = [s[2] for s in scores]
         n = len(scores)
-        bm, bs = (st.mean(bests),  st.pstdev(bests)  if n > 1 else 0.0)
-        fm, fs = (st.mean(finals), st.pstdev(finals) if n > 1 else 0.0)
-        print(f"{key[0]:<14} {key[1]:<32} {key[2]:<6.2f} {n:<3} "
-              f"{bm:6.1f} ± {bs:5.1f}   {fm:6.1f} ± {fs:5.1f}")
+        lm, ls = (st.mean(l10s),   st.pstdev(l10s)   if n > 1 else 0.0)
+        bm, _  = (st.mean(bests),  0.0)
+        fm, _  = (st.mean(finals), 0.0)
+        print(f"{key[0]:<16} {key[1]:<30} {n:<3} {lm:6.1f} ± {ls:5.1f}          "
+              f"{bm:6.1f}        {fm:6.1f}")
 
 
 if __name__ == "__main__":
