@@ -118,6 +118,8 @@ def train_iql(args) -> None:
     )
     if args.capa:
         agent_kwargs["unc_beta"] = args.unc_beta
+        agent_kwargs["critic_syn_gate"] = args.capa_plus
+        agent_kwargs["critic_syn_coef"] = args.critic_syn_coef
     agent = AgentClass(**agent_kwargs)
 
     # ── Buffers ───────────────────────────────────────────────────────────
@@ -329,6 +331,13 @@ if __name__ == "__main__":
                         help="CAPA uncertainty-gate strength on syn AWR rows: "
                              "gate(syn) = exp(-unc_beta * q_ensemble_std). "
                              "1.0 = standard. 0.0 = disable gate (ablation).")
+    parser.add_argument("--capa_plus", action="store_true",
+                        help="CAPA+: also feed gated (low-uncertainty) synthetic "
+                             "transitions into the V/Q updates, not just the actor. "
+                             "Trades reward-immunity for critic coverage; gate→0 on "
+                             "untrusted syn ⇒ degenerates to vanilla CAPA.")
+    parser.add_argument("--critic_syn_coef", type=float, default=1.0,
+                        help="CAPA+ coefficient scaling the gated-syn V/Q loss terms.")
 
     # ── Q-ensemble ───────────────────────────────────────────────────────
     parser.add_argument("--num_critics", type=int, default=2,

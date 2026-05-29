@@ -64,9 +64,19 @@ class CAPAAgent(IQLAgent):
     incoherent.
     """
 
-    def __init__(self, *args, unc_beta: float = 1.0, **kwargs):
+    def __init__(self, *args, unc_beta: float = 1.0,
+                 critic_syn_gate: bool = False, critic_syn_coef: float = 1.0,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.unc_beta = float(unc_beta)
+        # CAPA+: when True, low-uncertainty synthetic transitions ALSO enter the
+        # V/Q updates (gated by exp(-unc_beta·Q_std)), instead of the critic
+        # being strictly real-only. Trades a bit of CAPA's reward-immunity for
+        # extra critic coverage — justified now that syn data is physics-
+        # consistent and the reward is the exact analytic reward. gate→0 on
+        # untrusted syn ⇒ degenerates back to vanilla CAPA (real-only critic).
+        self.critic_syn_gate = bool(critic_syn_gate)
+        self.critic_syn_coef = float(critic_syn_coef)
         if self.sa_iql:
             raise ValueError(
                 "CAPA is incompatible with --sa_iql. Drop --sa_iql for CAPA runs."
@@ -76,7 +86,9 @@ class CAPAAgent(IQLAgent):
             print(f"  WARN: unc_beta={unc_beta} but num_critics={self.num_critics}; "
                   "uncertainty gate degenerates (need num_critics >= 3 for "
                   "meaningful Q-std). Consider --num_critics 10.")
-        print(f"CAPAAgent: critic-real-only mode, unc_beta={self.unc_beta}")
+        mode = "CAPA+ (gated-syn critic)" if self.critic_syn_gate else "critic-real-only"
+        print(f"CAPAAgent: {mode} mode, unc_beta={self.unc_beta}"
+              + (f", critic_syn_coef={self.critic_syn_coef}" if self.critic_syn_gate else ""))
 
     # ──────────────────────────────────────────────────────────────────────
     # update — fully overrides IQLAgent.update with CAPA routing
@@ -102,6 +114,27 @@ class CAPAAgent(IQLAgent):
         r_next_obs = real_batch["next_obs"]
         r_done     = real_batch["done"]
 
+        # ── 0.5 CAPA+: pull TRUSTED (low-uncertainty) syn rows for the critic ─
+        # Only active when critic_syn_gate=True. gate = exp(-unc_beta·Q_std);
+        # high-disagreement (OOD) syn rows get ~0 weight, so the critic only
+        # absorbs synthetic transitions the ensemble is confident about.
+        syn_for_critic = None
+        if self.critic_syn_gate:
+            b_obs    = batch["obs"]
+            b_action = batch["action"]
+            src = batch.get("source", torch.ones(b_obs.shape[0], device=self.device))
+            m = src < 0.5
+            if bool(m.any()):
+                with torch.no_grad():
+                    qa   = self.q_tgt.target.all(b_obs[m], b_action[m])   # (M, Bs)
+                    gate = torch.exp(-self.unc_beta * qa.std(dim=0))       # (Bs,)
+                syn_for_critic = dict(
+                    obs=b_obs[m], action=b_action[m],
+                    reward=batch["reward"][m], next_obs=batch["next_obs"][m],
+                    done=batch["done"][m], gate=gate,
+                )
+                metrics["train/critic_gate_syn_mean"] = float(gate.mean().item())
+
         # ── 1. V update on REAL data ───────────────────────────────────────
         self.opt_v.zero_grad(set_to_none=True)
         with autocast(enabled=(self.device.type == "cuda")):
@@ -110,6 +143,20 @@ class CAPAAgent(IQLAgent):
             v      = self.v(r_obs)
             v_diff = q_tgt - v
             v_loss = self._expectile_loss(v_diff)   # standard expectile, no SA-IQL
+
+            # CAPA+: gated-syn expectile term (trusted syn extends V coverage)
+            if syn_for_critic is not None:
+                vs = self.v(syn_for_critic["obs"])
+                with torch.no_grad():
+                    qts = self.q_tgt.target.min(syn_for_critic["obs"],
+                                                syn_for_critic["action"])
+                dvs = qts - vs
+                ws  = torch.where(dvs >= 0,
+                                  torch.full_like(dvs, self.expectile),
+                                  torch.full_like(dvs, 1.0 - self.expectile))
+                v_loss_syn = (syn_for_critic["gate"] * ws * dvs.pow(2)).mean()
+                v_loss = v_loss + self.critic_syn_coef * v_loss_syn
+                metrics["loss/v_syn"] = v_loss_syn.item()
 
         self.scaler_v.scale(v_loss).backward()
         self.scaler_v.unscale_(self.opt_v)
@@ -142,6 +189,20 @@ class CAPAAgent(IQLAgent):
                 q_loss     = q_loss + self.pa_weight * pa_loss
                 metrics["loss/pa"]          = pa_loss.item()
                 metrics["train/q_ood_mean"] = ood_q.mean().item()
+
+            # CAPA+: gated-syn TD term (trusted syn extends Q coverage). Uses the
+            # syn reward+next-state — sound now that data is physics-consistent
+            # and reward is exact-analytic; gate filters the untrusted rows.
+            if syn_for_critic is not None:
+                with torch.no_grad():
+                    v_next_s = self.v(syn_for_critic["next_obs"])
+                    target_s = (syn_for_critic["reward"]
+                                + self.discount * (1.0 - syn_for_critic["done"]) * v_next_s)
+                all_q_s  = self.q.all(syn_for_critic["obs"], syn_for_critic["action"])  # (M, Bs)
+                q_err_s  = (all_q_s - target_s.unsqueeze(0)).pow(2)                      # (M, Bs)
+                q_loss_syn = (syn_for_critic["gate"].unsqueeze(0) * q_err_s).mean()
+                q_loss = q_loss + self.critic_syn_coef * q_loss_syn
+                metrics["loss/q_syn"] = q_loss_syn.item()
 
         self.scaler_q.scale(q_loss).backward()
         self.scaler_q.unscale_(self.opt_q)
