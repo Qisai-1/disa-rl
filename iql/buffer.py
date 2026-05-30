@@ -75,7 +75,8 @@ class ReplayBuffer:
                  terminal_penalty: bool = True,
                  gpu_resident: bool = True,
                  reward_scale: float = 1.0,
-                 reward_norm: str = "none"):
+                 reward_norm: str = "none",
+                 obs_norm: bool = False):
         self.device = device
         data = np.load(data_path, allow_pickle=True)
 
@@ -94,6 +95,21 @@ class ReplayBuffer:
 
         if terminal_penalty:
             rewards = rewards - terminals
+
+        # Standard CORL/IQL observation normalization. Computed on the real
+        # dataset (always — even for syn buffers — to keep policies in a
+        # consistent space at train + eval). Saved on the buffer so the
+        # SyntheticBuffer and Evaluator can apply identical normalization.
+        self.obs_norm = obs_norm
+        self.obs_mean = obs.mean(axis=0).astype(np.float32)
+        self.obs_std  = (obs.std(axis=0) + 1e-3).astype(np.float32)
+        if obs_norm:
+            obs      = (obs      - self.obs_mean) / self.obs_std
+            next_obs = (next_obs - self.obs_mean) / self.obs_std
+            print(f"  obs norm: per-dim (mean→0, std→1); raw range "
+                  f"[{float(self.obs_mean.min()):.2f}, {float(self.obs_mean.max()):.2f}] "
+                  f"std-range [{float(self.obs_std.min()):.2f}, "
+                  f"{float(self.obs_std.max()):.2f}]")
 
         # Standard CORL/IQL reward normalization (D4RL locomotion). Scales
         # per-step rewards by 1000/(max_ep_return-min_ep_return). Our raw
@@ -209,6 +225,8 @@ class SyntheticBuffer:
         temperature:       float = 1.0,
         gpu_resident:      bool  = True,
         reward_scale:      float = 1.0,
+        obs_mean:          Optional[np.ndarray] = None,   # apply real-buffer obs stats
+        obs_std:           Optional[np.ndarray] = None,
     ):
         self.device = device
         data = np.load(data_path, allow_pickle=True)
@@ -225,6 +243,12 @@ class SyntheticBuffer:
         # `normalize_rewards=False` path is used, we need consistent scale.
         if reward_scale != 1.0:
             rewards = rewards * reward_scale
+
+        # Apply real-dataset obs normalization to syn obs (consistent train space).
+        if obs_mean is not None and obs_std is not None:
+            obs      = (obs      - obs_mean) / obs_std
+            next_obs = (next_obs - obs_mean) / obs_std
+            print(f"  syn obs norm: applied real-dataset stats")
 
         n_original = len(obs)
 

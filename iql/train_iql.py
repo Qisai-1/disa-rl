@@ -125,7 +125,8 @@ def train_iql(args) -> None:
     # ── Buffers ───────────────────────────────────────────────────────────
     real_buffer = ReplayBuffer(data_path, device,
                                 reward_scale=args.reward_scale,
-                                reward_norm=args.reward_norm)
+                                reward_norm=args.reward_norm,
+                                obs_norm=args.obs_norm)
 
     synthetic_buffer = None
     alpha = 1.0  # default: pure real
@@ -137,6 +138,10 @@ def train_iql(args) -> None:
             # are pre-scaled into the same magnitude as real before the
             # ±3σ OOD filter runs (else the filter rejects all syn).
             syn_reward_scale = args.reward_scale * getattr(real_buffer, "_corl_factor", 1.0)
+            # Obs normalization stats only when --obs_norm is on; else syn
+            # stays in raw obs space matching the real buffer.
+            syn_obs_mean = real_buffer.obs_mean if args.obs_norm else None
+            syn_obs_std  = real_buffer.obs_std  if args.obs_norm else None
             synthetic_buffer = SyntheticBuffer(
                 syn_path, device,
                 real_reward_mean  = real_buffer.reward_mean,
@@ -145,6 +150,8 @@ def train_iql(args) -> None:
                 filter_sigma      = 3.0,
                 return_weighting  = True,
                 reward_scale      = syn_reward_scale,
+                obs_mean          = syn_obs_mean,
+                obs_std           = syn_obs_std,
             )
             alpha = args.alpha
         else:
@@ -163,7 +170,10 @@ def train_iql(args) -> None:
     )
 
     # ── Evaluator ─────────────────────────────────────────────────────────
-    evaluator = make_evaluator(args.env, device, n_episodes=10)
+    eval_obs_mean = real_buffer.obs_mean if args.obs_norm else None
+    eval_obs_std  = real_buffer.obs_std  if args.obs_norm else None
+    evaluator = make_evaluator(args.env, device, n_episodes=10,
+                                obs_mean=eval_obs_mean, obs_std=eval_obs_std)
 
     # ── WandB ─────────────────────────────────────────────────────────────
     env_tag  = args.env.replace("-v2", "").replace("-", "_")
@@ -381,6 +391,10 @@ if __name__ == "__main__":
                         help="Reward normalization. 'corl' = standard IQL "
                              "D4RL locomotion recipe: rewards × 1000/"
                              "(max_ep_return-min_ep_return). Default 'none'.")
+    parser.add_argument("--obs_norm", action="store_true", default=False,
+                        help="Standard CORL/IQL per-dim obs normalization "
+                             "((obs - mean) / std) using real-dataset stats. "
+                             "Applied identically to syn and at eval.")
     parser.add_argument("--pa_weight", type=float, default=0.0,
                         help="Weight of PARS Penalty-for-Infeasible-Actions loss term. "
                              "Typical: 0.0001 (MuJoCo) — 0.01 (sparse).")

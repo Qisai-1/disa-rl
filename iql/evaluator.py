@@ -13,7 +13,7 @@ D4RL normalization reference scores (from the original D4RL paper):
 from __future__ import annotations
 import numpy as np
 import torch
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 # ──────────────────────────────────────────────────────────────────────────────
 # D4RL reference scores for normalization
@@ -76,12 +76,20 @@ class Evaluator:
         n_episodes:   int           = 10,
         device:       torch.device  = torch.device("cpu"),
         seed:         int           = 0,
+        obs_mean:     Optional[np.ndarray] = None,
+        obs_std:      Optional[np.ndarray] = None,
     ):
         self.env_name    = env_name
         self.dataset_name = dataset_name
         self.n_episodes  = n_episodes
         self.device      = device
         self.seed        = seed
+        # Per-dim obs normalization. Train-time stats from the real buffer.
+        # When provided, raw env obs are normalized before the actor call.
+        self.obs_mean = (torch.from_numpy(obs_mean).float().to(device)
+                         if obs_mean is not None else None)
+        self.obs_std  = (torch.from_numpy(obs_std).float().to(device)
+                         if obs_std is not None else None)
         self._env        = None
 
         # Try to build env
@@ -134,6 +142,8 @@ class Evaluator:
 
             while not done:
                 obs_t  = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+                if self.obs_mean is not None:
+                    obs_t = (obs_t - self.obs_mean) / self.obs_std
                 action = actor.act(obs_t, deterministic=True).squeeze(0).cpu().numpy()
                 action = np.clip(action, -1.0, 1.0)
 
@@ -185,6 +195,8 @@ def make_evaluator(
     dataset_name: str,
     device:       torch.device,
     n_episodes:   int = 10,
+    obs_mean:     Optional[np.ndarray] = None,
+    obs_std:      Optional[np.ndarray] = None,
 ) -> Evaluator:
     gym_name = DATASET_TO_GYM.get(dataset_name, dataset_name)
     return Evaluator(
@@ -192,4 +204,6 @@ def make_evaluator(
         dataset_name = dataset_name,
         n_episodes   = n_episodes,
         device       = device,
+        obs_mean     = obs_mean,
+        obs_std      = obs_std,
     )

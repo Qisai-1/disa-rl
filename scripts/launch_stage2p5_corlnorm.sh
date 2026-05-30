@@ -9,9 +9,10 @@
 #  Our temperature β=3 and expectile τ=0.7 were tuned for the lower scale →
 #  the AWR weight exp(β·adv) becomes too peaky → policy underfits.
 #
-#  Test: --reward_norm corl on stable config × {offline_only, CAPA+GTA-winner}
-#  × {hopper, walker} × 3 seeds. Should lift offline baseline substantially
-#  AND improve CAPA+GTA (same reason: critic+policy losses both better-scaled).
+#  Test: --reward_norm corl AND --obs_norm (the full standard CORL/IQL recipe)
+#  on stable config × {offline_only, CAPA+GTA-winner} × {hopper, walker} × 3
+#  seeds. Combined fix expected to lift offline baseline substantially AND
+#  improve CAPA+GTA (same reason: critic+policy losses both better-scaled).
 #
 #  USAGE:
 #    bash scripts/launch_stage2p5_corlnorm.sh <ALPHA> <COEF>
@@ -40,7 +41,8 @@ done
 
 mkdir -p logs
 COMMON="--num_steps 500000 --save_every 100000 --eval_every 10000 \
-        --expectile 0.7 --temperature 3.0 --reward_scale 1 --reward_norm corl \
+        --expectile 0.7 --temperature 3.0 --reward_scale 1 \
+        --reward_norm corl --obs_norm \
         --q_hidden_dims 256 256 --wandb_project disa-rl-s2p5"
 AUG="--mode augmented --alpha ${ALPHA} --bc_weight 0.1 --alpha_warmup 50000 --alpha_ramp 50000"
 CAPA="--capa --capa_plus --unc_beta 1.0 --critic_syn_coef ${COEF} \
