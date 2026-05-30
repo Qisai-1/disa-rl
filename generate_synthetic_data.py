@@ -152,11 +152,15 @@ def _load_iql_critic(env: str, obs_dim: int, action_dim: int, device,
     agent.q.eval(); agent.v.eval(); agent.actor.eval()
 
     def q_fn(s, a):
-        q1, q2 = agent.q(s, a)
-        return torch.min(q1, q2)
+        out = agent.q(s, a)
+        # Works for TwinQ (returns (q1, q2) tuple) AND QEnsemble (returns (M,B) tensor).
+        if isinstance(out, tuple):
+            return torch.min(out[0], out[1])
+        return out.min(dim=0).values
     def v_fn(s):
         return agent.v(s)
-    print(f"  VCDG critic loaded from {iql_ckpt}")
+    print(f"  VCDG/Q-guidance critic loaded from {iql_ckpt}  "
+          f"(critic type: {type(agent.q).__name__})")
     return q_fn, v_fn, agent
 
 
@@ -196,7 +200,9 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
                              integrate_velocity=False,
                              gta=False, gta_noise_ratio=0.5, gta_return_alpha=1.2,
                              gta_adaptive_alpha=False,
-                             gta_alpha_min=1.0, gta_alpha_max=1.5):
+                             gta_alpha_min=1.0, gta_alpha_max=1.5,
+                             gta_q_guidance=False, gta_q_guidance_scale=0.5,
+                             gta_q_guidance_ckpt=None):
     """
     Parameters
     ----------
@@ -250,15 +256,24 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
     else:
         approx_q_pool = None
 
-    # VCDG critic (only loaded if requested)
+    # VCDG and/or GTA-Q-guided critic (loaded if either path requests it)
     q_fn = v_fn = agent_critic = None
-    if use_vcdg:
-        print("\n─── VCDG: loading IQL critic ──────────────────────────")
+    if use_vcdg or gta_q_guidance:
+        print("\n─── Loading IQL critic for guidance ──────────────────────")
+        # Prefer the explicit gta_q_guidance_ckpt if given; else fall back to vcdg path
+        guide_ckpt = gta_q_guidance_ckpt if (gta_q_guidance and gta_q_guidance_ckpt) else vcdg_iql_ckpt
         q_fn, v_fn, agent_critic = _load_iql_critic(
-            env, obs_dim, action_dim, device, iql_ckpt=vcdg_iql_ckpt,
+            env, obs_dim, action_dim, device, iql_ckpt=guide_ckpt,
         )
-        print(f"  guidance_scale={vcdg_guidance_scale}  "
-              f"td_relabel={vcdg_td_relabel}  q_anomaly={vcdg_q_anomaly}\n")
+        if use_vcdg:
+            print(f"  VCDG: guidance_scale={vcdg_guidance_scale}  "
+                  f"td_relabel={vcdg_td_relabel}  q_anomaly={vcdg_q_anomaly}")
+        if gta_q_guidance:
+            print(f"  GTA-Q-guidance: scale={gta_q_guidance_scale}  "
+                  f"(applied per Heun step on (s,a) channels)\n")
+            # NB: q_fn expects obs in the space the IQL agent was trained in.
+            # If that ckpt used --obs_norm, you'll need to re-normalize before
+            # calling q_fn — track via a follow-up (Stage-2.5+ ckpts).
 
     # Inverse Dynamics Model (Pillar 1) — replaces diffusion action head
     idm_net = idm_s_mean = idm_s_std = None
@@ -340,8 +355,45 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
             norm_ret = ((amp_ret - nrm.return_mean) / nrm.return_std).astype(np.float32)
             cond     = torch.from_numpy(
                 np.concatenate([norm_s0, norm_ret[:, None]], axis=1)).to(device)
-            x_gen = generator.cfm.heun_sample_partial(
-                x1_t, cond, noise_ratio=gta_noise_ratio, nfe=nfe, cfg_scale=cfg_scale)
+            # Choose sampler: Q-guided if requested, else plain GTA partial-Heun.
+            if gta_q_guidance and q_fn is not None:
+                from diffusion.value_guided import q_guided_partial
+                # Closure: take (obs, act) in DataNormalizer space → denormalize →
+                # call q_fn (which expects raw obs/action). Returns (N,) Q scalar.
+                obs_dn = nrm.obs.denormalize
+                act_dn = nrm.action.denormalize if hasattr(nrm, "action") else (lambda a: a)
+                def q_closure(o_norm, a_norm):
+                    o_raw = torch.from_numpy(
+                        obs_dn(o_norm.detach().cpu().numpy().astype(np.float32))
+                    ).to(device, dtype=torch.float32) if not torch.is_tensor(obs_dn(o_norm[0:1].detach().cpu().numpy())) else None
+                    # Faster: assume normalizers operate on numpy; do round-trip on GPU manually
+                    return q_fn(o_norm, a_norm)  # placeholder — see note below
+                # The closure above is a stub: a proper denormalize-on-GPU requires
+                # the normalizer to expose torch ops. To avoid silent mis-norm,
+                # we use the simpler q_fn directly when generator.normalizer.obs has
+                # `.mean`, `.std` as numpy arrays (the standard case):
+                _omean = torch.from_numpy(nrm.obs.mean.astype("float32")).to(device)
+                _ostd  = torch.from_numpy(nrm.obs.std.astype("float32")).to(device)
+                _amean = (torch.from_numpy(nrm.action.mean.astype("float32")).to(device)
+                          if hasattr(nrm, "action") else None)
+                _astd  = (torch.from_numpy(nrm.action.std.astype("float32")).to(device)
+                          if hasattr(nrm, "action") else None)
+                def q_closure(o_norm, a_norm):
+                    o_raw = o_norm * _ostd + _omean
+                    if _amean is not None:
+                        a_raw = a_norm * _astd + _amean
+                    else:
+                        a_raw = a_norm
+                    return q_fn(o_raw, a_raw)
+                x_gen = q_guided_partial(
+                    generator.cfm, x1_t, cond, q_closure,
+                    obs_dim=obs_dim, action_dim=action_dim,
+                    noise_ratio=gta_noise_ratio, nfe=nfe, cfg_scale=cfg_scale,
+                    guidance_scale=gta_q_guidance_scale,
+                )
+            else:
+                x_gen = generator.cfm.heun_sample_partial(
+                    x1_t, cond, noise_ratio=gta_noise_ratio, nfe=nfe, cfg_scale=cfg_scale)
             gen_oa = nrm.denormalize_batch(
                 x_gen.detach().cpu().numpy(), obs_dim, action_dim)         # (B,T,D)
             obs_b     = gen_oa[..., :obs_dim]
@@ -565,6 +617,17 @@ if __name__ == "__main__":
                         help="Minimum α applied to the HIGHEST-return real sub-trajectories.")
     parser.add_argument("--gta_alpha_max", type=float, default=1.5,
                         help="Maximum α applied to the LOWEST-return real sub-trajectories.")
+    parser.add_argument("--gta_q_guidance", action="store_true",
+                        help="NOVELTY — Q-guided GTA: at each Heun denoising step, "
+                             "take a gradient of Q(s,a) wrt the trajectory and add "
+                             "it to the velocity. Stronger than V-guidance because "
+                             "Q sees BOTH obs and action channels. Requires --gta + "
+                             "--gta_q_guidance_ckpt (or --vcdg_iql_ckpt fallback).")
+    parser.add_argument("--gta_q_guidance_scale", type=float, default=0.5,
+                        help="Strength of the Q-gradient guidance term.")
+    parser.add_argument("--gta_q_guidance_ckpt", type=str, default=None,
+                        help="Explicit IQL/CAPA ckpt for the Q-guidance critic. "
+                             "Falls back to --vcdg_iql_ckpt or the auto path.")
     parser.add_argument("--gta_return_alpha", type=float, default=1.2,
                         help="GTA return amplification α>1: condition on α·return to "
                              "steer toward higher-return compositions.")
@@ -587,4 +650,7 @@ if __name__ == "__main__":
         gta_adaptive_alpha=args.gta_adaptive_alpha,
         gta_alpha_min=args.gta_alpha_min,
         gta_alpha_max=args.gta_alpha_max,
+        gta_q_guidance=args.gta_q_guidance,
+        gta_q_guidance_scale=args.gta_q_guidance_scale,
+        gta_q_guidance_ckpt=args.gta_q_guidance_ckpt,
     )
