@@ -174,7 +174,7 @@ def train_iql(args) -> None:
                 syn_path, device,
                 real_reward_mean  = real_buffer.reward_mean,
                 real_reward_std   = real_buffer.reward_std,
-                normalize_rewards = True,
+                normalize_rewards = args.syn_normalize_rewards,
                 filter_sigma      = 3.0,
                 return_weighting  = True,
                 reward_scale      = syn_reward_scale,
@@ -430,6 +430,12 @@ if __name__ == "__main__":
                         help="Standard CORL/IQL per-dim obs normalization "
                              "((obs - mean) / std) using real-dataset stats. "
                              "Applied identically to syn and at eval.")
+    parser.add_argument("--syn_normalize_rewards", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="If True (default): renormalize syn reward distribution "
+                             "to match real (mean+std) — protects against syn reward "
+                             "bias. Pass --no-syn_normalize_rewards for GTA-amplified "
+                             "data where the mean shift IS the signal.")
 
     # ── Backbone (defaults to IQL; td3bc is the second AAAI backbone) ────
     parser.add_argument("--backbone", type=str, default="iql",
