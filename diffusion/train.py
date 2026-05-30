@@ -629,6 +629,9 @@ if __name__ == "__main__":
                              "non-default (e.g. 'diffusion_kin') for experiments "
                              "so production 'diffusion/' checkpoints are never "
                              "overwritten.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (controls torch/numpy init + data shuffling). "
+                             "Use different values for diffusion ensemble members.")
     args = parser.parse_args()
 
     if args.env not in ENV_REGISTRY:
@@ -681,7 +684,7 @@ if __name__ == "__main__":
             val_fraction      = 0.05,
         ),
         device        = "cuda",
-        seed          = 42,
+        seed          = args.seed,
         wandb_project = "disa-rl",
         wandb_entity  = args.wandb_entity,
         # Each env gets a unique run name on WandB
