@@ -129,6 +129,103 @@ def value_guided_heun(
     return x
 
 
+def q_guided_partial(
+    cfm,
+    x1_t:               Tensor,      # (B, T, D) NORMALIZED clean seed
+    cond:               Tensor,
+    q_fn:               Callable[[Tensor, Tensor], Tensor],  # Q(obs, action) → (N,)
+    obs_dim:            int,
+    action_dim:         int,
+    noise_ratio:        float = 0.5,
+    nfe:                int   = 20,
+    cfg_scale:          float = 1.5,
+    guidance_scale:     float = 0.5,
+    guidance_schedule:  str   = "linear-ramp",
+) -> Tensor:
+    """
+    Q-guided variant of GTA's partial-noising sampler.
+
+    Composes:
+      - GTA partial-noising (start from x1_t = real clean traj, add noise to
+        ratio μ, denoise) — preserves stitching from in-distribution seeds.
+      - Q-function guidance on the obs+action channels at each denoising step:
+        gradient ascent on Q(s, a) steers the trajectory toward higher-Q
+        compositions the diffusion alone might not reach.
+
+    Difference vs value_guided_heun:
+      - V-guidance only sees s, so it can only shape obs trajectories; the
+        action sub-vector is left to drift with the prior.
+      - Q-guidance sees (s, a), so it shapes BOTH obs and action channels.
+        Stronger signal, especially for offline-RL since Q is what the
+        downstream IQL/CAPA agent actually optimizes — the diffusion samples
+        line up with the policy-improvement direction.
+
+    Returns the generated (B, T, D) normalized trajectory.
+
+    Notes:
+      - q_fn is expected to take denormalised (s, a) — pass a closure that
+        denormalises x_g internally before calling the IQL Q ensemble.
+        Use Q.min(s, a) (twin-Q min) for a stable per-row scalar.
+      - This mirrors GTA's partial path; for "pure" Q-guided generation from
+        noise, drop the partial-noising seed and start from torch.randn.
+    """
+    cfm_model = cfm.model
+    device = cfm.device
+    T = cfm_model.T
+    D = cfm_model.D
+    assert x1_t.shape == (x1_t.shape[0], T, D), f"x1_t {x1_t.shape} ≠ ({x1_t.shape[0]}, {T}, {D})"
+    assert D >= obs_dim + action_dim, f"D={D} < obs+action={obs_dim+action_dim}"
+
+    # GTA partial-noising: start from noise mixed with x1
+    B = x1_t.shape[0]
+    t_start = 1.0 - noise_ratio
+    x = (1.0 - t_start) * torch.randn_like(x1_t) + t_start * x1_t
+
+    # Sub-steps over [t_start, 1.0]
+    sub_nfe = max(1, int(round(nfe * noise_ratio)))
+    dt = (1.0 - t_start) / sub_nfe
+
+    for i in range(sub_nfe):
+        t_curr_scalar = t_start + i * dt
+        t_next_scalar = min(t_curr_scalar + dt, 1.0)
+        t_curr = torch.full((B,), t_curr_scalar, device=device)
+        t_next = torch.full((B,), t_next_scalar, device=device)
+
+        with torch.no_grad():
+            v_uncond = cfm._velocity(x, t_curr, cond, cfg_scale)
+
+        # Ramp guidance UP with t (only late steps have meaningful Q-grad).
+        if guidance_schedule in ("linear-ramp", "linear-decay"):
+            lam = guidance_scale * t_curr_scalar
+        else:
+            lam = guidance_scale
+
+        if lam > 0:
+            x_g = x.detach().requires_grad_(True)
+            with torch.enable_grad():
+                obs_flat = x_g[..., :obs_dim].reshape(-1, obs_dim)
+                act_flat = x_g[..., obs_dim:obs_dim + action_dim].reshape(-1, action_dim)
+                q_vals = q_fn(obs_flat, act_flat)              # (B*T,)
+                q_vals.sum().backward()
+            grad = x_g.grad.detach()                            # (B, T, D)
+
+            # Apply to both obs and action sub-vectors. Normalize each
+            # sub-vector per (b, t) for scale stability — same trick as V-guidance.
+            guidance = torch.zeros_like(v_uncond)
+            for slc in (slice(0, obs_dim), slice(obs_dim, obs_dim + action_dim)):
+                g_slc = grad[..., slc]
+                g_norm = g_slc.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                guidance[..., slc] = lam * (g_slc / g_norm)
+            v_uncond = v_uncond + guidance
+
+        with torch.no_grad():
+            x_pred = x + v_uncond * dt
+            v_next = cfm._velocity(x_pred, t_next, cond, cfg_scale)
+            x      = x + 0.5 * (v_uncond + v_next) * dt
+
+    return x
+
+
 def td_relabel_rewards(
     observations:      np.ndarray,   # (N, obs_dim)
     next_observations: np.ndarray,   # (N, obs_dim)
