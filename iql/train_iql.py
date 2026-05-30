@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iql.agent import IQLAgent
 from iql.agent_capa import CAPAAgent
+from iql.agent_td3bc import TD3BCAgent
 from iql.buffer import ReplayBuffer, SyntheticBuffer, AugmentedReplayBuffer
 from iql.evaluator import make_evaluator
 
@@ -89,38 +90,65 @@ def train_iql(args) -> None:
             raise SystemExit("ERROR: --capa is incompatible with --sa_iql. "
                              "CAPA replaces DRC's defensive mechanisms.")
 
-    AgentClass = CAPAAgent if args.capa else IQLAgent
-    agent_kwargs = dict(
-        obs_dim     = obs_dim,
-        action_dim  = action_dim,
-        hidden_dims = (256, 256),
-        q_hidden_dims = q_h,
-        v_hidden_dims = q_h,
-        expectile   = args.expectile,
-        expectile_real = args.expectile_real,
-        expectile_syn  = args.expectile_syn,
-        temperature = args.temperature,
-        discount    = 0.99,
-        tau         = 0.005,
-        lr_q        = 3e-4,
-        lr_v        = 3e-4,
-        lr_pi       = 3e-4,
-        bc_weight   = args.bc_weight,
-        adv_normalize = args.adv_normalize,
-        num_critics  = args.num_critics,
-        critic_subset_size = args.critic_subset,
-        sa_iql       = args.sa_iql,
-        sa_clip      = tuple(args.sa_clip),
-        action_noise_std = args.action_noise_std,
-        pa_weight    = args.pa_weight,
-        pa_min_q     = args.pa_min_q,
-        device      = device,
-    )
-    if args.capa:
-        agent_kwargs["unc_beta"] = args.unc_beta
-        agent_kwargs["critic_syn_gate"] = args.capa_plus
-        agent_kwargs["critic_syn_coef"] = args.critic_syn_coef
-    agent = AgentClass(**agent_kwargs)
+    if args.backbone == "td3bc":
+        if args.sa_iql:
+            raise SystemExit("ERROR: --backbone td3bc is incompatible with --sa_iql.")
+        if args.capa:
+            raise SystemExit("ERROR: --capa is the IQL augmentation. For TD3+BC "
+                             "use --td3bc_real_only_critic --td3bc_mixed_actor "
+                             "--td3bc_unc_beta which expose the same hooks.")
+        agent = TD3BCAgent(
+            obs_dim          = obs_dim,
+            action_dim       = action_dim,
+            hidden_dims      = (256, 256),
+            q_hidden_dims    = q_h,
+            bc_alpha         = args.td3bc_alpha,
+            bc_weight        = args.bc_weight,
+            discount         = 0.99,
+            tau              = 0.005,
+            policy_noise     = args.td3bc_policy_noise,
+            noise_clip       = args.td3bc_noise_clip,
+            policy_freq      = args.td3bc_policy_freq,
+            num_critics      = args.num_critics,
+            critic_subset_size = args.critic_subset,
+            real_only_critic = args.td3bc_real_only_critic,
+            mixed_actor      = args.td3bc_mixed_actor,
+            unc_beta         = args.td3bc_unc_beta,
+            device           = device,
+        )
+    else:
+        AgentClass = CAPAAgent if args.capa else IQLAgent
+        agent_kwargs = dict(
+            obs_dim     = obs_dim,
+            action_dim  = action_dim,
+            hidden_dims = (256, 256),
+            q_hidden_dims = q_h,
+            v_hidden_dims = q_h,
+            expectile   = args.expectile,
+            expectile_real = args.expectile_real,
+            expectile_syn  = args.expectile_syn,
+            temperature = args.temperature,
+            discount    = 0.99,
+            tau         = 0.005,
+            lr_q        = 3e-4,
+            lr_v        = 3e-4,
+            lr_pi       = 3e-4,
+            bc_weight   = args.bc_weight,
+            adv_normalize = args.adv_normalize,
+            num_critics  = args.num_critics,
+            critic_subset_size = args.critic_subset,
+            sa_iql       = args.sa_iql,
+            sa_clip      = tuple(args.sa_clip),
+            action_noise_std = args.action_noise_std,
+            pa_weight    = args.pa_weight,
+            pa_min_q     = args.pa_min_q,
+            device      = device,
+        )
+        if args.capa:
+            agent_kwargs["unc_beta"] = args.unc_beta
+            agent_kwargs["critic_syn_gate"] = args.capa_plus
+            agent_kwargs["critic_syn_coef"] = args.critic_syn_coef
+        agent = AgentClass(**agent_kwargs)
 
     # ── Buffers ───────────────────────────────────────────────────────────
     real_buffer = ReplayBuffer(data_path, device,
@@ -179,7 +207,12 @@ def train_iql(args) -> None:
     env_tag  = args.env.replace("-v2", "").replace("-", "_")
     # CAPA runs go to a separate output dir so they don't collide with
     # vanilla augmented (DRC) runs at the same alpha.
-    mode_dir = "capa" if args.capa else args.mode
+    if args.backbone == "td3bc":
+        mode_dir = f"td3bc_{args.mode}"
+    elif args.capa:
+        mode_dir = "capa"
+    else:
+        mode_dir = args.mode
     run_name = f"iql_{env_tag}_{mode_dir}_alpha{args.alpha}_s{args.seed}"
     output_dir = os.path.join("./checkpoints", args.env, "iql", mode_dir,
                                f"alpha{args.alpha}", f"seed_{args.seed}")
@@ -244,6 +277,8 @@ def train_iql(args) -> None:
     need_real_batch = (
         (args.mode == "augmented" and args.bc_weight > 0)
         or args.capa
+        or (args.backbone == "td3bc" and
+            (args.td3bc_real_only_critic or args.bc_weight > 0))
     )
 
     for step in range(start_step, args.num_steps + 1):
@@ -263,11 +298,11 @@ def train_iql(args) -> None:
         if step % args.log_every == 0:
             metrics["step"] = step
             wandb.log(metrics, step=step)
-            pbar.set_postfix(
-                Q=f"{metrics['loss/q']:.3f}",
-                V=f"{metrics['loss/v']:.3f}",
-                pi=f"{metrics['loss/actor']:.3f}",
-            )
+            postfix = {"Q": f"{metrics.get('loss/q', 0):.3f}",
+                       "pi": f"{metrics.get('loss/actor', 0):.3f}"}
+            if "loss/v" in metrics:  # IQL only — TD3+BC has no V
+                postfix["V"] = f"{metrics['loss/v']:.3f}"
+            pbar.set_postfix(**postfix)
 
         if step % args.eval_every == 0:
             eval_metrics = evaluator.evaluate(agent.actor)
@@ -395,6 +430,31 @@ if __name__ == "__main__":
                         help="Standard CORL/IQL per-dim obs normalization "
                              "((obs - mean) / std) using real-dataset stats. "
                              "Applied identically to syn and at eval.")
+
+    # ── Backbone (defaults to IQL; td3bc is the second AAAI backbone) ────
+    parser.add_argument("--backbone", type=str, default="iql",
+                        choices=["iql", "td3bc"],
+                        help="iql = vanilla / CAPA / CAPA+ on IQL (default). "
+                             "td3bc = TD3+BC (Fujimoto & Gu 2021) with the same "
+                             "DiSA hooks (real-only critic, mixed actor, "
+                             "optional uncertainty gate). See iql/agent_td3bc.py.")
+    parser.add_argument("--td3bc_alpha", type=float, default=2.5,
+                        help="TD3+BC α: λ = α / E[|Q(s,π(s))|]. 2.5 default.")
+    parser.add_argument("--td3bc_policy_noise", type=float, default=0.2,
+                        help="TD3+BC target-action smoothing noise σ.")
+    parser.add_argument("--td3bc_noise_clip", type=float, default=0.5,
+                        help="TD3+BC target-noise clip range.")
+    parser.add_argument("--td3bc_policy_freq", type=int, default=2,
+                        help="TD3+BC delayed-actor frequency (every k critic steps).")
+    parser.add_argument("--td3bc_real_only_critic", action="store_true", default=True,
+                        help="TD3+BC: train critic on REAL transitions only "
+                             "(matches CAPA's critic immunity). Default ON.")
+    parser.add_argument("--td3bc_mixed_actor", action="store_true", default=True,
+                        help="TD3+BC: -Q(s,π(s)) on MIXED batch (syn as extra "
+                             "policy-improvement proposals). Default ON.")
+    parser.add_argument("--td3bc_unc_beta", type=float, default=0.0,
+                        help="TD3+BC: CAPA-style uncertainty gate on syn rows "
+                             "of -Q term. 0.0 = off; 1.0 = standard.")
     parser.add_argument("--pa_weight", type=float, default=0.0,
                         help="Weight of PARS Penalty-for-Infeasible-Actions loss term. "
                              "Typical: 0.0001 (MuJoCo) — 0.01 (sparse).")
