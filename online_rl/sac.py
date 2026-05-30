@@ -36,7 +36,7 @@ from torch.cuda.amp import GradScaler
 from typing import Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from iql.networks import GaussianActor, TwinQNetwork, EMATarget
+from iql.networks import GaussianActor, TwinQNetwork, QEnsemble, EMATarget
 
 
 def create_sac_from_iql(iql_ckpt_path: str,
@@ -99,16 +99,24 @@ class SACAgent:
         target_entropy:   Optional[float] = None,
         init_temperature: float = 0.2,
         device:           torch.device = torch.device("cpu"),
+        num_critics:      int = 2,           # 2 = TwinQ, >2 = QEnsemble (RLPD)
+        critic_subset:    int = 2,           # used only when num_critics > 2
     ):
         self.obs_dim     = obs_dim
         self.action_dim  = action_dim
         self.gamma       = gamma
         self.device      = device
         self.total_steps = 0
+        self.num_critics = num_critics
 
         # Same architecture as IQL — weights transfer directly
-        self.actor          = GaussianActor(obs_dim, action_dim, hidden_dims).to(device)
-        self.critic         = TwinQNetwork(obs_dim, action_dim, hidden_dims).to(device)
+        self.actor = GaussianActor(obs_dim, action_dim, hidden_dims).to(device)
+        if num_critics <= 2:
+            self.critic = TwinQNetwork(obs_dim, action_dim, hidden_dims).to(device)
+        else:
+            self.critic = QEnsemble(obs_dim, action_dim, hidden_dims,
+                                    num_critics=num_critics,
+                                    subset_size=critic_subset).to(device)
         self.critic_target  = EMATarget(self.critic, tau=tau).to(device)
 
         # Learnable entropy temperature
@@ -153,33 +161,57 @@ class SACAgent:
         q_sd = ckpt["q"]
         tq_sd = ckpt.get("q_tgt", q_sd)
 
-        if any(k.startswith("qs.0.") for k in q_sd):
-            # QEnsemble — extract the first two critic state_dicts and load
-            # them into SAC's twin Q. SAC will diverge them online.
-            def extract(prefix: str, sd: dict) -> dict:
+        if any(k.startswith("qs.") for k in q_sd):
+            # Source = QEnsemble of M_src critics. Three cases:
+            #   1. SAC critic is also QEnsemble — copy as many as match.
+            #   2. SAC critic is TwinQ — take first two ensemble members.
+            #   3. Sizes mismatch — partial load + warn.
+            def extract(prefix: int, sd: dict) -> dict:
                 p = f"qs.{prefix}."
                 return {k[len(p):]: v for k, v in sd.items() if k.startswith(p)}
 
-            q0 = extract("0", q_sd)
-            q1 = extract("1", q_sd)
-            t0 = extract("0", tq_sd)
-            t1 = extract("1", tq_sd)
-            try:
-                self.critic.q1.load_state_dict(q0)
-                self.critic.q2.load_state_dict(q1)
-                self.critic_target.target.q1.load_state_dict(t0)
-                self.critic_target.target.q2.load_state_dict(t1)
-                print(f"Loaded DRC-IQL QEnsemble[0,1] → SAC twin Q | {iql_ckpt_path}")
-            except RuntimeError as e:
-                print(f"WARN: ensemble→twin shape mismatch — initializing twin Q from "
-                      f"actor branch only. Cause: {e!s:.140s}")
+            n_src = len({int(k.split(".")[1]) for k in q_sd if k.startswith("qs.")})
+
+            if isinstance(self.critic, QEnsemble):
+                n_copy = min(n_src, self.critic.num_critics)
+                for i in range(n_copy):
+                    self.critic.qs[i].load_state_dict(extract(i, q_sd))
+                    self.critic_target.target.qs[i].load_state_dict(extract(i, tq_sd))
+                print(f"Loaded QEnsemble[0..{n_copy-1}] / src={n_src} → "
+                      f"SAC QEnsemble (size {self.critic.num_critics}) | {iql_ckpt_path}")
+                if n_copy < self.critic.num_critics:
+                    print(f"  NB: {self.critic.num_critics - n_copy} extra critics "
+                          f"randomly initialized (diversity bonus).")
+            else:
+                # Legacy: SAC is TwinQ → take first two
+                try:
+                    self.critic.q1.load_state_dict(extract(0, q_sd))
+                    self.critic.q2.load_state_dict(extract(1, q_sd))
+                    self.critic_target.target.q1.load_state_dict(extract(0, tq_sd))
+                    self.critic_target.target.q2.load_state_dict(extract(1, tq_sd))
+                    print(f"Loaded QEnsemble[0,1] → SAC TwinQ | {iql_ckpt_path}")
+                except RuntimeError as e:
+                    print(f"WARN: ensemble→twin shape mismatch. Cause: {e!s:.140s}")
         else:
-            # Legacy TwinQ — preserve old behavior
-            self.critic.q1.load_state_dict(q_sd)
-            self.critic.q2.load_state_dict(q_sd)
-            self.critic_target.target.q1.load_state_dict(tq_sd)
-            self.critic_target.target.q2.load_state_dict(tq_sd)
-            print(f"Loaded IQL TwinQ → SAC | {iql_ckpt_path}")
+            # Legacy TwinQ source → only works into TwinQ SAC
+            if isinstance(self.critic, QEnsemble):
+                # Replicate the twin into the first two ensemble members,
+                # leave the rest random for diversity.
+                self.critic.qs[0].load_state_dict(
+                    {k.replace("q1.", ""): v for k, v in q_sd.items() if k.startswith("q1.")})
+                self.critic.qs[1].load_state_dict(
+                    {k.replace("q2.", ""): v for k, v in q_sd.items() if k.startswith("q2.")})
+                self.critic_target.target.qs[0].load_state_dict(
+                    {k.replace("q1.", ""): v for k, v in tq_sd.items() if k.startswith("q1.")})
+                self.critic_target.target.qs[1].load_state_dict(
+                    {k.replace("q2.", ""): v for k, v in tq_sd.items() if k.startswith("q2.")})
+                print(f"Loaded TwinQ → SAC QEnsemble[0,1] (rest random) | {iql_ckpt_path}")
+            else:
+                self.critic.q1.load_state_dict(q_sd)
+                self.critic.q2.load_state_dict(q_sd)
+                self.critic_target.target.q1.load_state_dict(tq_sd)
+                self.critic_target.target.q2.load_state_dict(tq_sd)
+                print(f"Loaded IQL TwinQ → SAC TwinQ | {iql_ckpt_path}")
 
     def align_entropy_with_iql(
         self,
@@ -248,15 +280,19 @@ class SACAgent:
         metrics  = {}
 
         # ── Critic update ─────────────────────────────────────────────
+        # Use .all() / .min() API so the same code works for TwinQ
+        # (M=2) and QEnsemble (M=num_critics, RLPD-style).
         self.opt_critic.zero_grad(set_to_none=True)
         with torch.no_grad():
-            next_a, next_lp   = self.actor.get_action(next_obs)
-            q1_next, q2_next  = self.critic_target.target(next_obs, next_a)
-            q_next   = torch.min(q1_next, q2_next) - self.alpha * next_lp
+            next_a, next_lp = self.actor.get_action(next_obs)
+            # min over (possibly random) subset — REDQ-style for QEnsemble,
+            # plain min(Q1,Q2) for TwinQ
+            q_next   = self.critic_target.target.min(next_obs, next_a) - self.alpha * next_lp
             q_target = reward + self.gamma * (1.0 - done) * q_next
 
-        q1, q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+        all_q = self.critic.all(obs, action)                # (M, B)
+        # Each critic gets its own TD loss; ensemble grad updates them all.
+        critic_loss = F.mse_loss(all_q, q_target.unsqueeze(0).expand_as(all_q))
 
         self.scaler_critic.scale(critic_loss).backward()
         self.scaler_critic.unscale_(self.opt_critic)
@@ -266,8 +302,9 @@ class SACAgent:
         self.critic_target.update(self.critic)
 
         metrics["online/critic_loss"] = critic_loss.item()
-        metrics["online/q_mean"]      = ((q1 + q2) / 2).mean().item()
+        metrics["online/q_mean"]      = all_q.mean().item()
         metrics["online/q_target"]    = q_target.mean().item()
+        metrics["online/q_std"]       = all_q.std(dim=0).mean().item()
 
         if critic_only:
             self.total_steps += 1
@@ -276,8 +313,8 @@ class SACAgent:
         # ── Actor update ───────────────────────────────────────────────
         self.opt_actor.zero_grad(set_to_none=True)
         new_a, log_prob = self.actor.get_action(obs)
-        q1_pi, q2_pi   = self.critic(obs, new_a)
-        q_pi = torch.min(q1_pi, q2_pi)
+        # Twin-style min for the actor target (RLPD uses subset-min too).
+        q_pi = self.critic.min(obs, new_a)
 
         # SAC actor loss: maximize E[Q(s,a) - α log π(a|s)]
         sac_loss = (self.alpha.detach() * log_prob - q_pi).mean()

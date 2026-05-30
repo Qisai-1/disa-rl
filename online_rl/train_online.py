@@ -192,15 +192,17 @@ def train_online(args) -> None:
 
     # ── SAC Agent ─────────────────────────────────────────────────────────
     agent = SACAgent(
-        obs_dim    = obs_dim,
-        action_dim = action_dim,
-        hidden_dims= (256, 256),
-        lr_actor   = 3e-4,
-        lr_critic  = 3e-4,
-        lr_alpha   = 3e-4,
-        gamma      = 0.99,
-        tau        = 0.005,
-        device     = device,
+        obs_dim       = obs_dim,
+        action_dim    = action_dim,
+        hidden_dims   = (256, 256),
+        lr_actor      = 3e-4,
+        lr_critic     = 3e-4,
+        lr_alpha      = 3e-4,
+        gamma         = 0.99,
+        tau           = 0.005,
+        device        = device,
+        num_critics   = args.num_critics,
+        critic_subset = args.critic_subset,
     )
 
     # Connection 1: Load offline IQL weights
@@ -431,6 +433,12 @@ if __name__ == "__main__":
     parser.add_argument("--transition_steps",    type=int,   default=20_000,
                         help="Steps over which conservative weight decays 1→0")
     parser.add_argument("--real_buffer_size",    type=int,   default=1_000_000)
+    parser.add_argument("--num_critics",         type=int,   default=10,
+                        help="Number of SAC critics. 2 = TwinQ (legacy), >2 = "
+                             "QEnsemble (RLPD-style, recommended for O2O).")
+    parser.add_argument("--critic_subset",       type=int,   default=2,
+                        help="Random subset for REDQ-style min over critics "
+                             "(only used when num_critics > 2).")
 
     # Adaptive ρ
     parser.add_argument("--eroll_every",    type=int, default=2_000)
