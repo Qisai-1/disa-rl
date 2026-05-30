@@ -100,6 +100,7 @@ def report_multi_protocol(glob_pat, method_substr, label):
 
 def main():
     s25 = report_multi_protocol('logs/s2p5_*.log', 'offline',  'Stage 2.5 (offline_only baseline)')
+    s25c = report_multi_protocol('logs/s2p5_*.log', 'capa+',    'Stage 2.5 (vanilla CAPA+GTA, no novelties)')
     s26 = report_multi_protocol('logs/s2p6_*.log', 'capa+',    'Stage 2.6 (CAPA+GTA, no-renorm)')
     s27 = report_multi_protocol('logs/s2p7_*.log', 'bestcombo', 'Stage 2.7 (full novelty pack)')
     s30 = report_multi_protocol('logs/s3p0_*.log', 'ensfilt',   'Stage 3.0 (ensemble-filtered syn)')
