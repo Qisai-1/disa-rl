@@ -270,10 +270,15 @@ class OnlineBuffer:
 
         If real buffer is empty (early online training), use pure synthetic.
         As real data accumulates, transitions to mostly real.
+
+        Adds a 'source' field: 1.0 for real rows, 0.0 for syn rows. Required
+        by CAPAAgent.update() to dispatch the uncertainty gate correctly.
         """
         # If no real data yet, use pure synthetic
         if len(self.real) == 0:
-            return self._get_synthetic(batch_size)
+            b = self._get_synthetic(batch_size)
+            b["source"] = torch.zeros(batch_size, device=self.device)
+            return b
 
         n_real = max(1, round(batch_size * self.real_fraction))
         n_syn  = batch_size - n_real
@@ -281,14 +286,33 @@ class OnlineBuffer:
         real_batch = self.real.sample(n_real)
 
         if n_syn == 0:
+            real_batch["source"] = torch.ones(n_real, device=self.device)
             return real_batch
 
         syn_batch = self._get_synthetic(n_syn)
 
-        return {
+        out = {
             k: torch.cat([real_batch[k], syn_batch[k]], dim=0)
             for k in real_batch
         }
+        out["source"] = torch.cat([
+            torch.ones(n_real, device=self.device),
+            torch.zeros(n_syn,  device=self.device),
+        ])
+        return out
+
+    def sample_real(self, batch_size: int) -> Dict[str, Tensor]:
+        """
+        Real-only batch — used by CAPAAgent.update() for V/Q losses.
+        Falls back to offline synthetic if the real buffer is empty
+        (no env interaction has happened yet).
+        """
+        if len(self.real) == 0:
+            # During the bootstrap phase (before any env rollouts), there's
+            # no real data yet — use offline synthetic as a proxy. This
+            # mirrors the offline training behavior on the synthetic buffer.
+            return self.offline.sample(batch_size)
+        return self.real.sample(batch_size)
 
     def stats(self) -> Dict[str, float]:
         return {
