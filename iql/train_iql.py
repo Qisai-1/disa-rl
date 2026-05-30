@@ -123,7 +123,9 @@ def train_iql(args) -> None:
     agent = AgentClass(**agent_kwargs)
 
     # ── Buffers ───────────────────────────────────────────────────────────
-    real_buffer = ReplayBuffer(data_path, device, reward_scale=args.reward_scale)
+    real_buffer = ReplayBuffer(data_path, device,
+                                reward_scale=args.reward_scale,
+                                reward_norm=args.reward_norm)
 
     synthetic_buffer = None
     alpha = 1.0  # default: pure real
@@ -131,6 +133,10 @@ def train_iql(args) -> None:
     if args.mode == "augmented":
         syn_path = args.synthetic_data or get_synthetic_path(args.env, vcdg=args.use_vcdg_data)
         if os.path.exists(syn_path):
+            # Pass the CORL norm factor through reward_scale so syn rewards
+            # are pre-scaled into the same magnitude as real before the
+            # ±3σ OOD filter runs (else the filter rejects all syn).
+            syn_reward_scale = args.reward_scale * getattr(real_buffer, "_corl_factor", 1.0)
             synthetic_buffer = SyntheticBuffer(
                 syn_path, device,
                 real_reward_mean  = real_buffer.reward_mean,
@@ -138,7 +144,7 @@ def train_iql(args) -> None:
                 normalize_rewards = True,
                 filter_sigma      = 3.0,
                 return_weighting  = True,
-                reward_scale      = args.reward_scale,
+                reward_scale      = syn_reward_scale,
             )
             alpha = args.alpha
         else:
@@ -370,6 +376,11 @@ if __name__ == "__main__":
     parser.add_argument("--reward_scale", type=float, default=1.0,
                         help="Multiply rewards by this factor (PARS). "
                              "Recommended: halfcheetah 5; hopper/walker2d 10; ant 5-10.")
+    parser.add_argument("--reward_norm", type=str, default="none",
+                        choices=["none", "corl"],
+                        help="Reward normalization. 'corl' = standard IQL "
+                             "D4RL locomotion recipe: rewards × 1000/"
+                             "(max_ep_return-min_ep_return). Default 'none'.")
     parser.add_argument("--pa_weight", type=float, default=0.0,
                         help="Weight of PARS Penalty-for-Infeasible-Actions loss term. "
                              "Typical: 0.0001 (MuJoCo) — 0.01 (sparse).")

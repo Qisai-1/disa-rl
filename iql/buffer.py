@@ -29,6 +29,39 @@ from torch import Tensor
 from typing import Dict, Optional
 
 
+def corl_reward_norm_factor(
+    rewards: np.ndarray,
+    terminals: np.ndarray,
+    timeouts: np.ndarray,
+    max_episode_steps: int = 1000,
+) -> float:
+    """
+    Standard CORL/IQL reward normalization factor for D4RL locomotion:
+        factor = max_episode_steps / (max_ep_return - min_ep_return)
+
+    Per-step rewards multiplied by this factor put episode returns into
+    a roughly [0, max_episode_steps] range, matching the temperature/expectile
+    tuning in the IQL paper (Kostrikov et al., ICLR 2022).
+    Reference: CORL `modify_reward` for D4RL halfcheetah/hopper/walker2d.
+    """
+    done = (terminals + timeouts) > 0
+    ep_returns, ret = [], 0.0
+    for r, d in zip(rewards, done):
+        ret += float(r)
+        if d:
+            ep_returns.append(ret)
+            ret = 0.0
+    if ret != 0.0:
+        ep_returns.append(ret)
+    if not ep_returns:
+        return 1.0
+    rmin, rmax = min(ep_returns), max(ep_returns)
+    span = rmax - rmin
+    if span <= 0:
+        return 1.0
+    return float(max_episode_steps) / float(span)
+
+
 class ReplayBuffer:
     """
     Real D4RL transition buffer loaded from .npz.
@@ -41,7 +74,8 @@ class ReplayBuffer:
     def __init__(self, data_path: str, device: torch.device,
                  terminal_penalty: bool = True,
                  gpu_resident: bool = True,
-                 reward_scale: float = 1.0):
+                 reward_scale: float = 1.0,
+                 reward_norm: str = "none"):
         self.device = device
         data = np.load(data_path, allow_pickle=True)
 
@@ -60,6 +94,22 @@ class ReplayBuffer:
 
         if terminal_penalty:
             rewards = rewards - terminals
+
+        # Standard CORL/IQL reward normalization (D4RL locomotion). Scales
+        # per-step rewards by 1000/(max_ep_return-min_ep_return). Our raw
+        # rewards (mean~2.4) are ~3× the scale the IQL paper's temperature
+        # β=3 and expectile τ=0.7 were tuned for; without this the AWR
+        # weight exp(β·adv) becomes too peaky → policy underfits.
+        self.reward_norm = reward_norm
+        self._corl_factor = 1.0
+        if reward_norm == "corl":
+            self._corl_factor = corl_reward_norm_factor(rewards, terminals, timeouts)
+            rewards = rewards * self._corl_factor
+            print(f"  CORL reward norm: ×{self._corl_factor:.4f}  "
+                  f"(per-step mean→{rewards.mean():.3f})")
+        elif reward_norm != "none":
+            raise ValueError(f"unknown reward_norm={reward_norm!r}; "
+                             f"expected 'none' or 'corl'")
 
         # PARS-style reward scaling. Multiplies the TD-target magnitude
         # which, combined with LayerNorm in the critic, sharpens Q-value
