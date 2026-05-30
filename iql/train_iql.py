@@ -148,6 +148,12 @@ def train_iql(args) -> None:
             agent_kwargs["unc_beta"] = args.unc_beta
             agent_kwargs["critic_syn_gate"] = args.capa_plus
             agent_kwargs["critic_syn_coef"] = args.critic_syn_coef
+            # Calibrated-stitching novelty knobs
+            agent_kwargs["awr_gate_mode"]          = args.awr_gate_mode
+            agent_kwargs["gbc_weight"]             = args.gbc_weight
+            agent_kwargs["gbc_gate_min"]           = args.gbc_gate_min
+            agent_kwargs["asym_expectile_syn"]     = args.asym_expectile_syn
+            agent_kwargs["critic_syn_coef_warmup"] = args.critic_syn_coef_warmup
         agent = AgentClass(**agent_kwargs)
 
     # ── Buffers ───────────────────────────────────────────────────────────
@@ -393,6 +399,32 @@ if __name__ == "__main__":
                              "untrusted syn ⇒ degenerates to vanilla CAPA.")
     parser.add_argument("--critic_syn_coef", type=float, default=1.0,
                         help="CAPA+ coefficient scaling the gated-syn V/Q loss terms.")
+
+    # ── Calibrated-stitching novelties (build for AAAI submission) ────────
+    parser.add_argument("--awr_gate_mode", type=str, default="scale",
+                        choices=["scale", "temper"],
+                        help='"scale" (legacy): w = exp(β·adv) · gate.  '
+                             '"temper" (NOVELTY): w = exp(β·gate·adv). The '
+                             'uncertainty gate flattens the AWR weight curve '
+                             'rather than just scaling it, preventing '
+                             'high-advantage / high-uncertainty syn rows from '
+                             'dominating after the exp blows them up.')
+    parser.add_argument("--gbc_weight", type=float, default=0.0,
+                        help="NOVELTY — Generative BC anchor weight on "
+                             "high-confidence syn rows. 0 disables. Adds an "
+                             "offensive signal-extraction term that AWR misses.")
+    parser.add_argument("--gbc_gate_min", type=float, default=0.5,
+                        help="Min gate value for a syn row to enter the GBC anchor.")
+    parser.add_argument("--asym_expectile_syn", action="store_true",
+                        help="NOVELTY — Asymmetric expectile τ_syn = "
+                             "0.5 + (τ-0.5)·gate on the gated-syn V loss. "
+                             "Confident syn stays optimistic; uncertain syn "
+                             "falls back to the median (more pessimistic).")
+    parser.add_argument("--critic_syn_coef_warmup", type=int, default=0,
+                        help="NOVELTY — Uncertainty-driven curriculum: linearly "
+                             "ramp critic_syn_coef from 0 to its target value "
+                             "over this many steps. Syn enters the critic only "
+                             "once the gate signal has stabilized.")
 
     # ── Q-ensemble ───────────────────────────────────────────────────────
     parser.add_argument("--num_critics", type=int, default=2,

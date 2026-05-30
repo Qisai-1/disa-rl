@@ -194,7 +194,9 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
                              vcdg_q_anomaly=True,
                              use_idm=False, idm_ckpt=None,
                              integrate_velocity=False,
-                             gta=False, gta_noise_ratio=0.5, gta_return_alpha=1.2):
+                             gta=False, gta_noise_ratio=0.5, gta_return_alpha=1.2,
+                             gta_adaptive_alpha=False,
+                             gta_alpha_min=1.0, gta_alpha_max=1.5):
     """
     Parameters
     ----------
@@ -299,9 +301,24 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
     if gta:
         gta_subtrajs, gta_subrets = build_real_subtrajs(env, traj_len, obs_dim, action_dim)
         nrm = generator.normalizer
-        print(f"  GTA mode: {len(gta_subtrajs):,} real sub-trajs  "
-              f"noise_ratio={gta_noise_ratio}  return_alpha={gta_return_alpha}  "
-              f"(amplified-return + partial-noising)")
+        # Precompute per-sub-traj alpha if adaptive mode is on:
+        # low-return seeds get max alpha (more lift), high-return get min alpha (safer).
+        # Linear in rank percentile of the full sub-traj return distribution.
+        if gta_adaptive_alpha:
+            ranks = gta_subrets.argsort().argsort().astype(np.float32)
+            pct   = ranks / max(len(ranks) - 1, 1)                          # 0=lowest, 1=highest
+            gta_alpha_per_traj = (gta_alpha_max
+                                  - (gta_alpha_max - gta_alpha_min) * pct).astype(np.float32)
+            print(f"  GTA mode (ADAPTIVE α): {len(gta_subtrajs):,} real sub-trajs  "
+                  f"noise_ratio={gta_noise_ratio}  α∈[{gta_alpha_min},{gta_alpha_max}] "
+                  f"by return-rank  (per-traj amplification + partial-noising)")
+            print(f"    α stats: mean={gta_alpha_per_traj.mean():.3f}  "
+                  f"min={gta_alpha_per_traj.min():.3f}  max={gta_alpha_per_traj.max():.3f}")
+        else:
+            gta_alpha_per_traj = None
+            print(f"  GTA mode: {len(gta_subtrajs):,} real sub-trajs  "
+                  f"noise_ratio={gta_noise_ratio}  return_alpha={gta_return_alpha}  "
+                  f"(amplified-return + partial-noising)")
 
     all_obs, all_actions, all_next_obs = [], [], []
 
@@ -316,7 +333,10 @@ def generate_synthetic_data(env, n_transitions=1_000_000, batch_size=64,
             # cond = [normalized s0, normalized AMPLIFIED return]
             s0       = x1_raw[:, 0, :obs_dim]
             norm_s0  = nrm.obs.normalize(s0).astype(np.float32)
-            amp_ret  = gta_return_alpha * rets
+            if gta_alpha_per_traj is not None:
+                amp_ret = gta_alpha_per_traj[bidx] * rets
+            else:
+                amp_ret = gta_return_alpha * rets
             norm_ret = ((amp_ret - nrm.return_mean) / nrm.return_std).astype(np.float32)
             cond     = torch.from_numpy(
                 np.concatenate([norm_s0, norm_ret[:, None]], axis=1)).to(device)
@@ -535,6 +555,16 @@ if __name__ == "__main__":
                              "baselines, esp. hopper-mr). Pairs with --integrate_velocity.")
     parser.add_argument("--gta_noise_ratio", type=float, default=0.5,
                         help="GTA noise ratio μ∈(0,1]: 0→keep real traj, 1→full gen.")
+    parser.add_argument("--gta_adaptive_alpha", action="store_true",
+                        help="ADAPTIVE α(τ): per-trajectory amplification based on the "
+                             "seed sub-trajectory's return percentile. Low-return seeds get "
+                             "α_max (more lift), high-return seeds get α_min (safer). "
+                             "Calibrated extension of GTA's uniform amplification. "
+                             "When set, overrides --gta_return_alpha.")
+    parser.add_argument("--gta_alpha_min", type=float, default=1.0,
+                        help="Minimum α applied to the HIGHEST-return real sub-trajectories.")
+    parser.add_argument("--gta_alpha_max", type=float, default=1.5,
+                        help="Maximum α applied to the LOWEST-return real sub-trajectories.")
     parser.add_argument("--gta_return_alpha", type=float, default=1.2,
                         help="GTA return amplification α>1: condition on α·return to "
                              "steer toward higher-return compositions.")
@@ -554,4 +584,7 @@ if __name__ == "__main__":
         integrate_velocity=args.integrate_velocity,
         gta=args.gta, gta_noise_ratio=args.gta_noise_ratio,
         gta_return_alpha=args.gta_return_alpha,
+        gta_adaptive_alpha=args.gta_adaptive_alpha,
+        gta_alpha_min=args.gta_alpha_min,
+        gta_alpha_max=args.gta_alpha_max,
     )

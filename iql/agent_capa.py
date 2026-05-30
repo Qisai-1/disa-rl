@@ -66,6 +66,12 @@ class CAPAAgent(IQLAgent):
 
     def __init__(self, *args, unc_beta: float = 1.0,
                  critic_syn_gate: bool = False, critic_syn_coef: float = 1.0,
+                 # Calibrated-stitching novelty knobs (default = legacy CAPA+):
+                 awr_gate_mode: str = "scale",           # "scale" | "temper"
+                 gbc_weight: float = 0.0,                # generative-BC anchor weight
+                 gbc_gate_min: float = 0.5,              # gate threshold for GBC inclusion
+                 asym_expectile_syn: bool = False,       # τ_syn = 0.5 + 0.2·gate
+                 critic_syn_coef_warmup: int = 0,        # linear ramp 0→coef over N steps
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.unc_beta = float(unc_beta)
@@ -77,6 +83,15 @@ class CAPAAgent(IQLAgent):
         # untrusted syn ⇒ degenerates back to vanilla CAPA (real-only critic).
         self.critic_syn_gate = bool(critic_syn_gate)
         self.critic_syn_coef = float(critic_syn_coef)
+
+        # Novelty knobs — see METHOD docstring at top of file
+        assert awr_gate_mode in ("scale", "temper"), awr_gate_mode
+        self.awr_gate_mode           = awr_gate_mode
+        self.gbc_weight              = float(gbc_weight)
+        self.gbc_gate_min            = float(gbc_gate_min)
+        self.asym_expectile_syn      = bool(asym_expectile_syn)
+        self.critic_syn_coef_warmup  = int(critic_syn_coef_warmup)
+
         if self.sa_iql:
             raise ValueError(
                 "CAPA is incompatible with --sa_iql. Drop --sa_iql for CAPA runs."
@@ -87,8 +102,22 @@ class CAPAAgent(IQLAgent):
                   "uncertainty gate degenerates (need num_critics >= 3 for "
                   "meaningful Q-std). Consider --num_critics 10.")
         mode = "CAPA+ (gated-syn critic)" if self.critic_syn_gate else "critic-real-only"
+        extras = []
+        if self.awr_gate_mode != "scale":         extras.append(f"awr={self.awr_gate_mode}")
+        if self.gbc_weight > 0:                    extras.append(f"gbc={self.gbc_weight}@{self.gbc_gate_min}")
+        if self.asym_expectile_syn:                extras.append("asym_expectile")
+        if self.critic_syn_coef_warmup > 0:        extras.append(f"coef_warmup={self.critic_syn_coef_warmup}")
         print(f"CAPAAgent: {mode} mode, unc_beta={self.unc_beta}"
-              + (f", critic_syn_coef={self.critic_syn_coef}" if self.critic_syn_gate else ""))
+              + (f", critic_syn_coef={self.critic_syn_coef}" if self.critic_syn_gate else "")
+              + (f"  [{','.join(extras)}]" if extras else ""))
+
+    def _current_critic_syn_coef(self) -> float:
+        """Linear warmup of critic_syn_coef from 0 → self.critic_syn_coef over
+        self.critic_syn_coef_warmup total_steps. Returns the live coefficient."""
+        if self.critic_syn_coef_warmup <= 0:
+            return self.critic_syn_coef
+        frac = min(1.0, self.total_steps / float(self.critic_syn_coef_warmup))
+        return self.critic_syn_coef * frac
 
     # ──────────────────────────────────────────────────────────────────────
     # update — fully overrides IQLAgent.update with CAPA routing
@@ -152,12 +181,22 @@ class CAPAAgent(IQLAgent):
                     qts = self.q_tgt.target.min(syn_for_critic["obs"],
                                                 syn_for_critic["action"])
                 dvs = qts - vs
-                ws  = torch.where(dvs >= 0,
-                                  torch.full_like(dvs, self.expectile),
-                                  torch.full_like(dvs, 1.0 - self.expectile))
+                # NOVELTY: asymmetric expectile by uncertainty. Confident syn
+                # (gate≈1) gets the standard upper-expectile τ; uncertain syn
+                # (gate≈0) falls back to the median (τ=0.5) — more pessimistic
+                # about the syn Q-target where the ensemble disagrees.
+                if self.asym_expectile_syn:
+                    tau_syn = 0.5 + (self.expectile - 0.5) * syn_for_critic["gate"]
+                    ws = torch.where(dvs >= 0, tau_syn, 1.0 - tau_syn)
+                else:
+                    ws = torch.where(dvs >= 0,
+                                     torch.full_like(dvs, self.expectile),
+                                     torch.full_like(dvs, 1.0 - self.expectile))
                 v_loss_syn = (syn_for_critic["gate"] * ws * dvs.pow(2)).mean()
-                v_loss = v_loss + self.critic_syn_coef * v_loss_syn
+                coef_now = self._current_critic_syn_coef()
+                v_loss = v_loss + coef_now * v_loss_syn
                 metrics["loss/v_syn"] = v_loss_syn.item()
+                metrics["train/critic_syn_coef_live"] = coef_now
 
         self.scaler_v.scale(v_loss).backward()
         self.scaler_v.unscale_(self.opt_v)
@@ -202,7 +241,11 @@ class CAPAAgent(IQLAgent):
                 all_q_s  = self.q.all(syn_for_critic["obs"], syn_for_critic["action"])  # (M, Bs)
                 q_err_s  = (all_q_s - target_s.unsqueeze(0)).pow(2)                      # (M, Bs)
                 q_loss_syn = (syn_for_critic["gate"].unsqueeze(0) * q_err_s).mean()
-                q_loss = q_loss + self.critic_syn_coef * q_loss_syn
+                # Curriculum (NOVELTY): coef is ramped from 0 → target over the
+                # warmup window, so syn enters the critic only once the gate signal
+                # has stabilized. Same coefficient used for V and Q.
+                coef_now_q = self._current_critic_syn_coef()
+                q_loss = q_loss + coef_now_q * q_loss_syn
                 metrics["loss/q_syn"] = q_loss_syn.item()
 
         self.scaler_q.scale(q_loss).backward()
@@ -263,7 +306,18 @@ class CAPAAgent(IQLAgent):
                 gate_syn = torch.exp(-self.unc_beta * q_std)
                 gate     = source + (1.0 - source) * gate_syn
 
-                weight = torch.exp(self.temperature * adv_for_weight).clamp(max=100.0) * gate
+                # AWR weight. Two routes for combining the gate with the
+                # AWR exponent:
+                #   "scale"  (legacy)  : w = exp(β·adv) · gate
+                #   "temper" (NOVELTY) : w = exp(β·gate·adv) — uncertainty
+                #     flattens the AWR weight curve instead of multiplicatively
+                #     suppressing it. Avoids the failure mode where a high-
+                #     advantage but high-uncertainty syn row dominates after the
+                #     exp blows it up and the gate barely dents it.
+                if self.awr_gate_mode == "temper":
+                    weight = torch.exp(self.temperature * gate * adv_for_weight).clamp(max=100.0)
+                else:
+                    weight = torch.exp(self.temperature * adv_for_weight).clamp(max=100.0) * gate
 
                 # Logging — average gate value on syn rows (1.0 = ungated; 0 = fully gated out)
                 syn_mask = source < 0.5
@@ -292,6 +346,27 @@ class CAPAAgent(IQLAgent):
             else:
                 actor_loss = awr_loss
                 metrics["loss/bc"] = 0.0
+
+            # NOVELTY — Generative BC anchor on HIGH-CONFIDENCE synthetic rows.
+            # Adds an *offensive* signal-extraction term: when the ensemble agrees
+            # that a syn (s, a) is in-distribution (gate >= gbc_gate_min), use it
+            # as a BC target on the policy. This captures behavior the diffusion
+            # invented that AWR misses because (a) its advantage is small or (b)
+            # the weight is dominated by real high-advantage rows.
+            if self.gbc_weight > 0.0:
+                gbc_mask = (source < 0.5) & (gate >= self.gbc_gate_min)
+                n_gbc = int(gbc_mask.sum().item())
+                if n_gbc > 0:
+                    log_prob_gbc = self.actor.log_prob(obs[gbc_mask], action_for_logp[gbc_mask])
+                    # Weight by gate so confidence above the threshold still matters
+                    g = gate[gbc_mask]
+                    gbc_loss = -(g * log_prob_gbc).sum() / (g.sum() + 1e-8)
+                    actor_loss = actor_loss + self.gbc_weight * gbc_loss
+                    metrics["loss/gbc"]      = float(gbc_loss.item())
+                    metrics["train/n_gbc"]   = float(n_gbc)
+                else:
+                    metrics["loss/gbc"]      = 0.0
+                    metrics["train/n_gbc"]   = 0.0
 
         self.scaler_pi.scale(actor_loss).backward()
         self.scaler_pi.unscale_(self.opt_pi)
