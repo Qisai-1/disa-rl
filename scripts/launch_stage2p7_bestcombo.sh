@@ -35,8 +35,8 @@ COEF=${COEF:-0.25}
 GBC=${GBC:-0.05}
 WARMUP=${WARMUP:-50000}
 
-if pgrep -f 'python -u iql/train_iql.py' >/dev/null; then
-    echo "ERROR: iql/train_iql.py running (GPUs busy). Wait for current sweep."; exit 1
+if [ "${SKIP_GUARD:-0}" != "1" ] && pgrep -f 'python -u iql/train_iql.py' >/dev/null; then
+    echo "ERROR: iql/train_iql.py running (GPUs busy). Pass SKIP_GUARD=1 to override."; exit 1
 fi
 for e in hopper-medium-replay-v2 walker2d-medium-replay-v2; do
     [ -f "data/synthetic_gta/$e/synthetic_transitions.npz" ] || {

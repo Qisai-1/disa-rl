@@ -25,8 +25,8 @@ cd "$(dirname "$0")/.."
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate disa
 
-if pgrep -f 'python -u iql/train_iql.py' >/dev/null; then
-    echo "ERROR: iql/train_iql.py running (GPUs busy)."
+if [ "${SKIP_GUARD:-0}" != "1" ] && pgrep -f 'python -u iql/train_iql.py' >/dev/null; then
+    echo "ERROR: iql/train_iql.py running (GPUs busy). Pass SKIP_GUARD=1 to override."
     exit 1
 fi
 NGPU=${NGPU:-4}
