@@ -29,6 +29,7 @@ conda activate disa
 
 ALPHA=${1:-0.5}
 COEF=${2:-0.25}
+NGPU=${NGPU:-4}
 
 if pgrep -f 'python -u iql/train_iql.py' >/dev/null; then
     echo "ERROR: iql/train_iql.py running (GPUs busy). Wait for current sweep."; exit 1
@@ -50,7 +51,7 @@ CAPA="--capa --capa_plus --unc_beta 1.0 --critic_syn_coef ${COEF} \
 
 i=0
 run () {  # env method seed
-  local env=$1 method=$2 seed=$3 gpu=$(( i % 4 )); i=$((i+1))
+  local env=$1 method=$2 seed=$3 gpu=$(( i % NGPU )); i=$((i+1))
   local tag="${env%%-*}_${method}_s${seed}"
   case $method in
     offline) flags="--mode offline_only --num_critics 2 --critic_subset 2" ;;

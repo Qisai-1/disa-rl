@@ -29,6 +29,7 @@ if pgrep -f 'python -u iql/train_iql.py' >/dev/null; then
     echo "ERROR: iql/train_iql.py running (GPUs busy)."
     exit 1
 fi
+NGPU=${NGPU:-4}
 for e in hopper-medium-replay-v2 walker2d-medium-replay-v2; do
     [ -f "data/synthetic_gta/$e/synthetic_transitions.npz" ] || {
         echo "FATAL: missing GTA syn data for $e"; exit 1
@@ -45,7 +46,7 @@ AUG="--mode augmented --alpha 0.5 --bc_weight 0.1 --alpha_warmup 50000 --alpha_r
 
 i=0
 run () {  # env method seed
-  local env=$1 method=$2 seed=$3 gpu=$(( i % 4 )); i=$((i+1))
+  local env=$1 method=$2 seed=$3 gpu=$(( i % NGPU )); i=$((i+1))
   local tag="${env%%-*}_${method}_s${seed}"
   case $method in
     offline)   flags="--mode offline_only --bc_weight 0.1" ;;
